@@ -4,6 +4,21 @@ Decisions, patterns, and lessons from building the Qwen3-TTS server. Each entry 
 
 ---
 
+## Entry 0028 — Inference deadlock: why streaming must go through the queue
+**Date**: 2026-03-01
+**Type**: What just happened
+**Related**: Issue #112 — Inference deadlock when streaming GPU thread stalls
+
+The TTS server deadlocked in production: health checks passed but every synthesis request hung forever. Root cause: `_stream_synthesize()` bypassed the `PriorityInferQueue` and called `_infer_executor.submit()` directly. When a streaming GPU inference hung (CUDA OOM from a competing process using 4+ GiB), the executor's single thread was permanently occupied. Since both the queue worker and streaming shared the same `ThreadPoolExecutor(max_workers=1)`, all subsequent inference — batch and streaming — was blocked.
+
+Three things made this unrecoverable: (1) `asyncio.Queue.get()` had no timeout, so the streaming consumer waited forever; (2) Python can't kill a running thread in a `ThreadPoolExecutor`, so the stuck thread couldn't be reclaimed; (3) no watchdog existed to detect the stuck state.
+
+The fix routes all streaming through `PriorityInferQueue`, adds `REQUEST_TIMEOUT` to `queue.get()`, and adds an inference watchdog that calls `os._exit(1)` when a job exceeds `REQUEST_TIMEOUT + 30s`. The self-terminate approach is deliberate — once a GPU thread is stuck, the process is in an unrecoverable state. Trying to "recreate the executor" would leak the stuck thread (still holding GPU memory) and risk CUDA context corruption. A clean `os._exit(1)` lets Docker restart with a fresh process and clean GPU state.
+
+The sentinel pattern in `_run()` also got a `finally` block. Previously, if `asyncio.run_coroutine_threadsafe(...).result()` itself failed (e.g., event loop already closed because the client disconnected), the chunk queue never received the termination sentinel, leaving the consumer hanging indefinitely.
+
+---
+
 ## Entry 0027 — Per-token streaming: fork-based architecture for sub-sentence latency
 **Date**: 2026-03-01
 **Type**: Why this design

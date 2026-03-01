@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.10.4 — 2026-03-01
+
+Fix inference deadlock when streaming GPU thread stalls (#112).
+
+### Fixed
+- **Inference deadlock**: streaming `_stream_synthesize()` bypassed `PriorityInferQueue`, submitting directly to the single-thread executor — a hung GPU thread blocked all inference forever while health checks passed (#112)
+- **Missing timeout**: `asyncio.Queue.get()` in `_stream_synthesize` had no timeout — now uses `REQUEST_TIMEOUT` to raise `TimeoutError` instead of blocking forever (#112)
+- **Streaming queue depth invisible**: `/stream`, `/stream/pcm`, `/ws` endpoints didn't track `_queue_tracker` — streaming requests were invisible to `/health` queue depth and couldn't be rejected when at capacity (#112)
+- **Sentinel leak**: `_run()` in streaming bridge could fail to send sentinel to chunk queue on certain error paths, leaving consumer hanging (#112)
+
+### Added
+- **Inference watchdog**: background task checks every 10s for jobs exceeding `REQUEST_TIMEOUT + 30s` — calls `os._exit(1)` for Docker restart on unrecoverable GPU hang (#112)
+
+---
+
 ## v0.10.3 — 2026-03-01
 
 Per-token streaming via rekuenkdr/Qwen3-TTS-streaming fork (#110).
