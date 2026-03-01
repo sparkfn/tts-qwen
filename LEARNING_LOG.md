@@ -4,6 +4,19 @@ Decisions, patterns, and lessons from building the Qwen3-TTS server. Each entry 
 
 ---
 
+## Entry 0029 — Streaming fork: why --force-reinstall is required
+**Date**: 2026-03-02
+**Type**: What just happened
+**Related**: Issue #114 — Streaming fork install silently fails
+
+The streaming TTS fork (`rekuenkdr/Qwen3-TTS-streaming`) and the official `qwen-tts` package share the same name and version (`qwen-tts==0.1.1`). When pip sees the same version already installed from `requirements.txt`, it skips the fork installation entirely — even though the fork has different code (adds `stream_generate_voice_clone()`). The `|| true` on the Dockerfile install line swallowed this silently, so the build succeeded but the server fell back to sentence-level streaming without any build-time error.
+
+The fix: `--force-reinstall` tells pip to reinstall regardless of version match, and removing `|| true` ensures a genuine installation failure (network error, broken fork) stops the build. The fork install must remain the last pip step in the Dockerfile so it always overrides the base package.
+
+Lesson: when two packages share the same name+version, pip's version check is insufficient — `--force-reinstall` is the only reliable override. And `|| true` on a required dependency is a time bomb.
+
+---
+
 ## Entry 0028 — Inference deadlock: why streaming must go through the queue
 **Date**: 2026-03-01
 **Type**: What just happened

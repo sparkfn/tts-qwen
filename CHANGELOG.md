@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.10.5 — 2026-03-02
+
+Fix silent streaming fork installation failure (#114).
+
+### Fixed
+- **Streaming fork silently skipped**: pip skipped `rekuenkdr/Qwen3-TTS-streaming` when `qwen-tts==0.1.1` was already installed (same package name + version) — added `--force-reinstall` to always override (#114)
+- **Install failures swallowed**: `|| true` on streaming fork install hid errors — removed so build fails loud if fork doesn't install (#114)
+
+---
+
 ## v0.10.4 — 2026-03-01
 
 Fix inference deadlock when streaming GPU thread stalls (#112).
