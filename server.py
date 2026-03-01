@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager, nullcontext
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
@@ -110,6 +110,13 @@ def _configure_logging():
         )
     # Intercept uvicorn / fastapi stdlib logs
     logging.basicConfig(handlers=[_InterceptHandler()], level=0, force=True)
+    # Silence noisy upstream loggers (INFO spam from HF config diffs)
+    for noisy in (
+        "qwen_tts.core.models.configuration_qwen3_tts",
+        "qwen_tts.core.tokenizer_12hz.configuration_qwen3_tts_tokenizer_v2",
+        "torchao",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 _configure_logging()
@@ -148,7 +155,7 @@ def _validate_env():
         except ValueError:
             errors.append("%s=%r. Must be a non-negative integer" % (var, raw))
 
-    stream_type = os.getenv("STREAM_TYPE", "sentence").lower()
+    stream_type = os.getenv("STREAM_TYPE", "token").lower()
     if stream_type not in ("sentence", "token"):
         errors.append("STREAM_TYPE=%r. Valid: 'sentence', 'token'" % stream_type)
 
@@ -214,6 +221,7 @@ async def lifespan(app):
         Instrumentator().instrument(app).expose(app)
     _set_cpu_affinity()
     asyncio.create_task(_idle_watchdog())
+    asyncio.create_task(_inference_watchdog())
     if PRELOAD_MODEL:
         logger.info("Loading model at startup (PRELOAD_MODEL=true)")
         loop = asyncio.get_running_loop()
@@ -248,7 +256,7 @@ app = FastAPI(title="Qwen3-TTS API", lifespan=lifespan)
 
 
 @app.exception_handler(APIError)
-async def api_error_handler(request, exc):
+async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content=ErrorResponse(
@@ -260,7 +268,7 @@ async def api_error_handler(request, exc):
 
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content=ErrorResponse(
@@ -309,6 +317,7 @@ class PriorityInferQueue:
         self._task = asyncio.create_task(self._worker())
 
     async def _worker(self):
+        global _infer_job_started_at
         while True:
             await self._event.wait()
             while True:
@@ -336,6 +345,7 @@ class PriorityInferQueue:
                     logger.debug("Queue dispatching batch", batch_size=len(batch_jobs),
                                  remaining=len(self._heap))
                     try:
+                        _infer_job_started_at = time.monotonic()
                         wavs, srs = await loop.run_in_executor(
                             self._infer_executor,
                             lambda: _do_synthesize_batch(texts, langs, voice_files, kwargs_list),
@@ -349,10 +359,13 @@ class PriorityInferQueue:
                         for job in batch_jobs:
                             if not job.future.done():
                                 job.future.set_exception(exc)
+                    finally:
+                        _infer_job_started_at = None
                 else:
                     logger.debug("Queue dispatching single job", priority=single_job.priority,
                                  remaining=len(self._heap))
                     try:
+                        _infer_job_started_at = time.monotonic()
                         result = await loop.run_in_executor(self._infer_executor, single_job.fn)
                         if not single_job.future.done():
                             single_job.future.set_result(result)
@@ -360,6 +373,8 @@ class PriorityInferQueue:
                         logger.opt(exception=True).error("Single job inference failed")
                         if not single_job.future.done():
                             single_job.future.set_exception(exc)
+                    finally:
+                        _infer_job_started_at = None
 
     async def submit(self, fn: callable, priority: int = PRIORITY_BATCH) -> any:
         loop = asyncio.get_running_loop()
@@ -390,6 +405,9 @@ class PriorityInferQueue:
 
 _infer_queue = PriorityInferQueue()
 
+# Timestamp when the current inference job started (None = idle)
+_infer_job_started_at: float | None = None
+
 # Lock to prevent concurrent load/unload
 _model_lock = asyncio.Lock()
 
@@ -404,7 +422,36 @@ TEXT_NORMALIZE = os.getenv("TEXT_NORMALIZE", "true").lower() in ("true", "1", "y
 
 # Queue depth limit — 503 when exceeded (0 = unlimited)
 MAX_QUEUE_DEPTH = int(os.getenv("MAX_QUEUE_DEPTH", "5"))
-_queue_depth = 0
+
+
+class _QueueDepthTracker:
+    """Asyncio-safe queue depth counter with context manager for clean inc/dec."""
+
+    def __init__(self) -> None:
+        self._depth = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def depth(self) -> int:
+        return self._depth
+
+    async def acquire(self, request_id: str, endpoint: str) -> None:
+        """Increment depth; raise APIError 503 if queue is full."""
+        async with self._lock:
+            if MAX_QUEUE_DEPTH > 0 and self._depth >= MAX_QUEUE_DEPTH:
+                logger.bind(request_id=request_id, endpoint=endpoint,
+                             queue_depth=self._depth).warning("Request rejected: queue full")
+                raise APIError(503, "QUEUE_FULL",
+                               f"Server busy: {self._depth} requests queued. Try again later.",
+                               headers={"Retry-After": "5"})
+            self._depth += 1
+
+    async def release(self) -> None:
+        async with self._lock:
+            self._depth -= 1
+
+
+_queue_tracker = _QueueDepthTracker()
 
 # Quantization mode — "", "int8" (bitsandbytes), or "fp8" (torchao)
 QUANTIZE = os.getenv("QUANTIZE", "").lower()
@@ -417,7 +464,7 @@ TORCH_COMPILE_MODE = os.getenv("TORCH_COMPILE_MODE", "max-autotune")
 CUDA_GRAPHS = os.getenv("CUDA_GRAPHS", "true").lower() in ("true", "1")
 
 # Per-token streaming mode — "sentence" (default) or "token" (sub-400ms TTFA)
-STREAM_TYPE = os.getenv("STREAM_TYPE", "sentence").lower()
+STREAM_TYPE = os.getenv("STREAM_TYPE", "token").lower()
 
 # Token-mode tuning: frames between emissions, first-chunk emit interval
 STREAM_EMIT_FRAMES = int(os.getenv("STREAM_EMIT_FRAMES", "4"))
@@ -576,7 +623,101 @@ def _resolve_quant_kwargs() -> tuple[torch.dtype, dict]:
     )
 
 
-def _load_model_sync():
+def _apply_fp8_quantization() -> None:
+    """Apply post-load FP8 weight quantization via torchao."""
+    try:
+        from torchao.quantization import quantize_, Float8WeightOnlyConfig
+        quantize_(model.model, Float8WeightOnlyConfig())
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        alloc_mb = torch.cuda.memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
+        logger.bind(gpu_allocated_mb=round(alloc_mb)).success(
+            "FP8 weight quantization applied via torchao"
+        )
+    except Exception as e:
+        logger.warning("FP8 quantization failed, continuing without: {}", e)
+
+
+def _apply_torch_compile() -> None:
+    """Compile model for faster inference (PyTorch 2.0+)."""
+    if os.getenv("TORCH_COMPILE", "true").lower() != "true":
+        return
+    try:
+        compile_mode = TORCH_COMPILE_MODE
+        # PyTorch doesn't allow both mode and options simultaneously.
+        # max-autotune already enables CUDA graphs internally, so only
+        # pass explicit options when using a mode that doesn't (e.g. "default").
+        if CUDA_GRAPHS and torch.cuda.is_available() and compile_mode not in ("max-autotune", "max-autotune-no-cudagraphs"):
+            compile_options: dict | None = {"triton.cudagraphs": True}
+        else:
+            compile_options = None
+        model.model = torch.compile(
+            model.model, mode=compile_mode, fullgraph=False, options=compile_options,
+        )
+        logger.bind(compile_mode=compile_mode, cuda_graphs=CUDA_GRAPHS).success(
+            "torch.compile enabled"
+        )
+    except Exception as e:
+        logger.warning("torch.compile not available or failed: {}", e)
+
+
+def _precompute_voice_prompts() -> None:
+    """Pre-compute voice clone prompts from reference audio files."""
+    logger.info("Pre-computing voice prompts from reference audio")
+    for voice_file in sorted(set(VOICE_MAP.values())):
+        path = os.path.join(_VOICES_DIR, voice_file)
+        if os.path.exists(path):
+            t_v = time.perf_counter()
+            prompts = model.create_voice_clone_prompt(ref_audio=path, x_vector_only_mode=True)
+            _voice_prompts[voice_file] = prompts
+            logger.bind(voice=voice_file, ms=round((time.perf_counter() - t_v) * 1000)).debug("Voice prompt computed")
+        else:
+            logger.bind(voice=voice_file, path=path).warning("Reference audio not found, skipping")
+    logger.bind(voices=len(_voice_prompts)).info("Voice prompts ready")
+
+
+def _gpu_warmup() -> None:
+    """Multi-length warmup to pre-cache CUDA kernels for different input sizes."""
+    if not torch.cuda.is_available() or not _voice_prompts:
+        return
+
+    logger.info("Warming up GPU with multi-length synthesis")
+    warmup_prompt = next(iter(_voice_prompts.values()))
+    warmup_texts = [
+        "Hello.",                                       # ~5 tokens — short prompt path
+        "Hello, how are you doing today?",              # ~20 tokens — medium
+        "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.",  # ~50 tokens — longer
+    ]
+    t_warmup = time.perf_counter()
+    for text in warmup_texts:
+        try:
+            with torch.inference_mode():
+                model.generate_voice_clone(
+                    text=text,
+                    language="English",
+                    voice_clone_prompt=warmup_prompt,
+                    max_new_tokens=256,
+                )
+            logger.bind(chars=len(text)).debug("Warmup synthesis complete")
+        except Exception as e:
+            logger.bind(text_preview=text[:20]).warning("Warmup synthesis failed: {}", e)
+    logger.bind(warmup_ms=round((time.perf_counter() - t_warmup) * 1000)).info("GPU warmup complete")
+    # Clear warmup allocations so steady-state VRAM is clean
+    _release_gpu_full()
+
+    # Pre-warm CUDA memory pool — allocate and free a large tensor so the
+    # allocator pre-reserves a contiguous block, reducing first-request jitter
+    logger.info("Pre-warming CUDA memory pool")
+    try:
+        dummy = torch.empty(64 * 1024 * 1024, dtype=torch.bfloat16, device="cuda")
+        del dummy
+        torch.cuda.empty_cache()
+        logger.debug("CUDA pool pre-warmed (128 MB dummy tensor)")
+    except Exception as e:
+        logger.warning("CUDA pool pre-warm failed: {}", e)
+
+
+def _load_model_sync() -> None:
     """Load model into GPU (blocking). Called from async context via lock."""
     global model, loaded_model_id, _last_used, _HAS_STREAMING, STREAM_TYPE
     from qwen_tts import Qwen3TTSModel
@@ -611,19 +752,8 @@ def _load_model_sync():
         **quant_kwargs,
     )
 
-    # Apply post-load FP8 quantization via torchao
     if QUANTIZE == "fp8":
-        try:
-            from torchao.quantization import quantize_, Float8WeightOnlyConfig
-            quantize_(model.model, Float8WeightOnlyConfig())
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            alloc_mb = torch.cuda.memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0
-            logger.bind(gpu_allocated_mb=round(alloc_mb)).success(
-                "FP8 weight quantization applied via torchao"
-            )
-        except Exception as e:
-            logger.warning("FP8 quantization failed, continuing without: {}", e)
+        _apply_fp8_quantization()
 
     # Create dedicated CUDA streams for overlapping compute + transfer
     global _inference_stream, _transfer_stream
@@ -764,7 +894,7 @@ def _unload_model_sync():
         logger.bind(gpu_allocated_mb=round(allocated), gpu_reserved_mb=round(reserved)).info("Model unloaded")
 
 
-async def _ensure_model_loaded():
+async def _ensure_model_loaded() -> None:
     """Load model if not already loaded. Thread-safe via lock."""
     global _last_used
     if model is not None:
@@ -779,7 +909,7 @@ async def _ensure_model_loaded():
         _last_used = time.time()
 
 
-async def _idle_watchdog():
+async def _idle_watchdog() -> None:
     """Background task that unloads model after IDLE_TIMEOUT seconds of inactivity."""
     while True:
         await asyncio.sleep(30)
@@ -792,6 +922,30 @@ async def _idle_watchdog():
                 if model is not None and time.time() - _last_used > IDLE_TIMEOUT:
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(_infer_executor, _unload_model_sync)
+
+
+_WATCHDOG_GRACE = 30  # seconds beyond REQUEST_TIMEOUT before kill
+
+
+async def _inference_watchdog_check() -> None:
+    """Single check: if a job has been running too long, exit the process."""
+    started = _infer_job_started_at
+    if started is None:
+        return
+    elapsed = time.monotonic() - started
+    deadline = REQUEST_TIMEOUT + _WATCHDOG_GRACE
+    if elapsed > deadline:
+        logger.bind(elapsed_s=round(elapsed), deadline_s=deadline).critical(
+            "Inference watchdog: job stuck, terminating process"
+        )
+        os._exit(1)
+
+
+async def _inference_watchdog() -> None:
+    """Background loop that checks for stuck inference jobs every 10 seconds."""
+    while True:
+        await asyncio.sleep(10)
+        await _inference_watchdog_check()
 
 
 def _parse_cpu_cores(spec: str) -> set[int]:
@@ -825,7 +979,7 @@ def _set_cpu_affinity():
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict:
     gpu_info = {}
     if torch.cuda.is_available():
         gpu_info = {
@@ -838,7 +992,7 @@ async def health():
         "model_loaded": model is not None,
         "model_id": loaded_model_id,
         "cuda": torch.cuda.is_available(),
-        "queue_depth": _queue_depth,
+        "queue_depth": _queue_tracker.depth,
         "max_queue_depth": MAX_QUEUE_DEPTH,
         "voices": list(VOICE_MAP.keys()),
         "audio_cache_size": len(_audio_cache),
@@ -850,8 +1004,18 @@ async def health():
     }
 
 
+@app.get("/v1/info")
+async def info() -> dict:
+    """Lightweight capability endpoint for downstream service discovery."""
+    return {
+        "stream_type": STREAM_TYPE,
+        "voices": list(VOICE_MAP.keys()),
+        "model_id": loaded_model_id,
+    }
+
+
 @app.post("/cache/clear")
-async def clear_cache():
+async def clear_cache() -> dict:
     """Clear the audio output cache and voice prompt cache."""
     audio_count = len(_audio_cache)
     voice_count = len(_voice_prompt_cache)
@@ -1055,7 +1219,7 @@ def _split_sentences(text: str) -> list[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 
-def _do_synthesize(text, language, voice_file, gen_kwargs, instruct=None):
+def _do_synthesize(text: str, language: str, voice_file: str, gen_kwargs: dict, instruct: str | None = None) -> tuple[list, int]:
     """Run TTS inference via voice cloning with pre-computed prompts.
 
     No per-request GC — let CUDA reuse cached allocations.
@@ -1167,7 +1331,7 @@ def _get_cached_voice_prompt(audio_bytes: bytes, ref_text: str | None):
     return prompt
 
 
-def _do_voice_clone(text, language, ref_prompt, gen_kwargs):
+def _do_voice_clone(text: str, language: str, ref_prompt: list, gen_kwargs: dict) -> tuple[list, int]:
     """Run voice clone inference using a pre-computed voice prompt.
 
     No per-request GC — let CUDA reuse cached allocations.
@@ -1217,22 +1381,41 @@ def _do_synthesize_streaming(text, language, voice_file, gen_kwargs):
 
 
 async def _stream_synthesize(text, language, voice_file, gen_kwargs):
-    """Async generator bridging sync GPU streaming -> async endpoint."""
-    queue = asyncio.Queue(maxsize=2)
+    """Async generator bridging sync GPU streaming -> async endpoint.
+
+    Routes through _infer_queue (not _infer_executor directly) so streaming
+    jobs are serialized with batch/single jobs.  queue.get() has a timeout
+    to prevent infinite hangs if the GPU thread stalls.
+    """
+    chunk_queue = asyncio.Queue(maxsize=2)
     loop = asyncio.get_running_loop()
 
     def _run():
+        sentinel_sent = False
         try:
             for chunk, sr in _do_synthesize_streaming(text, language, voice_file, gen_kwargs):
-                # Blocking put — applies backpressure to GPU thread when queue is full
-                asyncio.run_coroutine_threadsafe(queue.put((chunk, sr)), loop).result()
-            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+                asyncio.run_coroutine_threadsafe(chunk_queue.put((chunk, sr)), loop).result()
+            asyncio.run_coroutine_threadsafe(chunk_queue.put(None), loop).result()
+            sentinel_sent = True
         except Exception as e:
-            asyncio.run_coroutine_threadsafe(queue.put(e), loop).result()
+            try:
+                asyncio.run_coroutine_threadsafe(chunk_queue.put(e), loop).result()
+                sentinel_sent = True
+            except Exception:
+                pass
+        finally:
+            if not sentinel_sent:
+                try:
+                    asyncio.run_coroutine_threadsafe(chunk_queue.put(None), loop).result(timeout=5)
+                except Exception:
+                    pass
 
-    _infer_executor.submit(_run)
+    # Submit through PriorityInferQueue instead of _infer_executor directly.
+    # Fire-and-forget: we consume chunks from chunk_queue, not the submit future.
+    asyncio.ensure_future(_infer_queue.submit(_run, priority=PRIORITY_REALTIME))
+
     while True:
-        item = await queue.get()
+        item = await asyncio.wait_for(chunk_queue.get(), timeout=REQUEST_TIMEOUT)
         if item is None:
             break
         if isinstance(item, Exception):
@@ -1240,7 +1423,7 @@ async def _stream_synthesize(text, language, voice_file, gen_kwargs):
         yield item
 
 
-async def _encode_audio_async(audio_data, sample_rate, output_format):
+async def _encode_audio_async(audio_data: np.ndarray, sample_rate: int, output_format: str) -> tuple[bytes, str]:
     """Run audio encoding in the CPU thread pool, overlapping with GPU work."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
@@ -1250,20 +1433,10 @@ async def _encode_audio_async(audio_data, sample_rate, output_format):
 
 
 @app.post("/v1/audio/speech")
-async def synthesize_speech(request: TTSRequest):
+async def synthesize_speech(request: TTSRequest) -> Response:
     """OpenAI-compatible TTS endpoint using Base model with voice cloning."""
-    global _queue_depth
-
     request_id = str(uuid.uuid4())[:8]
     t_start = time.perf_counter()
-
-    # Early rejection when queue is full
-    if MAX_QUEUE_DEPTH > 0 and _queue_depth >= MAX_QUEUE_DEPTH:
-        logger.bind(request_id=request_id, endpoint="/v1/audio/speech",
-                     queue_depth=_queue_depth).warning("Request rejected: queue full")
-        raise APIError(503, "QUEUE_FULL",
-                       f"Server busy: {_queue_depth} requests queued. Try again later.",
-                       headers={"Retry-After": "5"})
 
     if not request.input or not request.input.strip():
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech").warning("Request rejected: empty input")
@@ -1276,7 +1449,7 @@ async def synthesize_speech(request: TTSRequest):
 
     voice_file = resolve_voice(request.voice)
     text = request.input.strip()
-    _queue_depth += 1
+    await _queue_tracker.acquire(request_id, "/v1/audio/speech")
 
     try:
         # Fast path: return cached audio without touching the GPU
@@ -1364,17 +1537,19 @@ async def synthesize_speech(request: TTSRequest):
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech").opt(exception=True).error("Synthesis failed")
         raise APIError(500, "SYNTHESIS_FAILED", f"Synthesis failed: {str(e)}")
     finally:
-        _queue_depth -= 1
+        await _queue_tracker.release()
 
 
 @app.post("/v1/audio/speech/stream")
-async def synthesize_speech_stream(request: TTSRequest):
+async def synthesize_speech_stream(request: TTSRequest) -> StreamingResponse:
     """Sentence-chunked SSE streaming TTS endpoint."""
     global _last_used
     request_id = str(uuid.uuid4())[:8]
     await _ensure_model_loaded()
+    await _queue_tracker.acquire(request_id, "/v1/audio/speech/stream")
 
     if not request.input or not request.input.strip():
+        await _queue_tracker.release()
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream").warning("Request rejected: empty input")
         raise APIError(400, "EMPTY_INPUT", "Input text is required")
 
@@ -1384,135 +1559,139 @@ async def synthesize_speech_stream(request: TTSRequest):
     sentences = _split_sentences(text)
 
     if not sentences:
+        await _queue_tracker.release()
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream").warning("Request rejected: no sentences")
         raise APIError(400, "NO_SENTENCES", "No sentences found in input")
 
     async def generate():
-        t_stream_start = time.perf_counter()
-        chunks_sent = 0
+        try:
+            t_stream_start = time.perf_counter()
+            chunks_sent = 0
 
-        if STREAM_TYPE == "token":
-            # Per-token streaming — full text, no sentence splitting
-            gen_kwargs = _build_gen_kwargs(text, request)
-            try:
-                async for chunk, sr_val in _stream_synthesize(text, language, voice_file, gen_kwargs):
-                    audio_data = np.array(chunk, dtype=np.float32, copy=True)
+            if STREAM_TYPE == "token":
+                # Per-token streaming — full text, no sentence splitting
+                gen_kwargs = _build_gen_kwargs(text, request)
+                try:
+                    async for chunk, sr_val in _stream_synthesize(text, language, voice_file, gen_kwargs):
+                        audio_data = np.array(chunk, dtype=np.float32, copy=True)
+                        if audio_data.ndim > 1:
+                            audio_data = audio_data.squeeze()
+                        audio_data = _adjust_speed(audio_data, sr_val, request.speed)
+                        if request.sample_rate:
+                            audio_data = _resample_audio(audio_data, sr_val, request.sample_rate)
+                        audio_int16 = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
+                        pcm_bytes = audio_int16.tobytes()
+                        yield f"data: {base64.b64encode(pcm_bytes).decode()}\n\n"
+                        t_now = time.perf_counter()
+                        logger.bind(
+                            request_id=request_id,
+                            chunk_idx=chunks_sent,
+                            ms=round((t_now - t_stream_start) * 1000) if chunks_sent == 0 else None,
+                            ttfc_ms=round((t_now - t_stream_start) * 1000) if chunks_sent == 0 else None,
+                        ).info("token_chunk_sent")
+                        chunks_sent += 1
+                        _last_used = time.time()
+                except asyncio.TimeoutError:
+                    logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream",
+                                chunks_sent=chunks_sent).error("Token stream timed out")
+                    yield "data: [ERROR] Synthesis timed out\n\n"
+                    return
+                except Exception as e:
+                    logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream",
+                                chunks_sent=chunks_sent).opt(exception=True).error("Token stream failed")
+                    yield f"data: [ERROR] {str(e)}\n\n"
+                    return
+
+                yield "data: [DONE]\n\n"
+                logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream", voice=voice_file,
+                            language=language, chunks_sent=chunks_sent, mode="token",
+                            chars=len(text), total_ms=round((time.perf_counter() - t_stream_start) * 1000),
+                            ).info("stream_complete")
+                return
+
+            # else: sentence-level streaming (existing code below, unchanged)
+            def _make_synth_fn(s, gk):
+                return lambda: _do_synthesize(s, language, voice_file, gk)
+
+            # Pre-fetch: submit first sentence immediately
+            pending_future = None
+            sentence_idx = 0
+
+            if sentences:
+                gk = _build_gen_kwargs(sentences[0], request)
+                pending_future = asyncio.ensure_future(
+                    asyncio.wait_for(
+                        _infer_queue.submit(
+                            _make_synth_fn(sentences[0], gk),
+                            priority=PRIORITY_REALTIME,
+                        ),
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                )
+
+            while sentence_idx < len(sentences):
+                try:
+                    t_sent = time.perf_counter()
+                    wavs, sr_val = await pending_future
+
+                    # Pre-fetch next sentence while we process current
+                    next_idx = sentence_idx + 1
+                    if next_idx < len(sentences):
+                        gk_next = _build_gen_kwargs(sentences[next_idx], request)
+                        pending_future = asyncio.ensure_future(
+                            asyncio.wait_for(
+                                _infer_queue.submit(
+                                    _make_synth_fn(sentences[next_idx], gk_next),
+                                    priority=PRIORITY_REALTIME,
+                                ),
+                                timeout=REQUEST_TIMEOUT,
+                            )
+                        )
+
+                    audio_data = np.array(wavs[0], dtype=np.float32, copy=True)
                     if audio_data.ndim > 1:
                         audio_data = audio_data.squeeze()
+
                     audio_data = _adjust_speed(audio_data, sr_val, request.speed)
+
                     if request.sample_rate:
                         audio_data = _resample_audio(audio_data, sr_val, request.sample_rate)
+
                     audio_int16 = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16)
                     pcm_bytes = audio_int16.tobytes()
                     yield f"data: {base64.b64encode(pcm_bytes).decode()}\n\n"
-                    t_now = time.perf_counter()
+                    sent_ms = round((time.perf_counter() - t_sent) * 1000)
                     logger.bind(
                         request_id=request_id,
-                        chunk_idx=chunks_sent,
-                        ms=round((t_now - t_stream_start) * 1000) if chunks_sent == 0 else None,
-                        ttfc_ms=round((t_now - t_stream_start) * 1000) if chunks_sent == 0 else None,
-                    ).info("token_chunk_sent")
+                        sentence_idx=chunks_sent,
+                        sentences_total=len(sentences),
+                        chars=len(sentences[sentence_idx]),
+                        ms=sent_ms,
+                        ttfs_ms=round((time.perf_counter() - t_stream_start) * 1000) if chunks_sent == 0 else None,
+                    ).info("sentence_synthesized")
                     chunks_sent += 1
+                    sentence_idx += 1
+
                     _last_used = time.time()
-            except asyncio.TimeoutError:
-                logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream",
-                            chunks_sent=chunks_sent).error("Token stream timed out")
-                yield "data: [ERROR] Synthesis timed out\n\n"
-                return
-            except Exception as e:
-                logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream",
-                            chunks_sent=chunks_sent).opt(exception=True).error("Token stream failed")
-                yield f"data: [ERROR] {str(e)}\n\n"
-                return
+
+                except asyncio.TimeoutError:
+                    logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream", voice=voice_file,
+                                 chunks_sent=chunks_sent, timeout_s=REQUEST_TIMEOUT).error("Stream synthesis timed out")
+                    yield "data: [ERROR] Synthesis timed out\n\n"
+                    return
+                except Exception as e:
+                    logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream", voice=voice_file,
+                                 chunks_sent=chunks_sent).opt(exception=True).error("Stream synthesis failed")
+                    yield f"data: [ERROR] {str(e)}\n\n"
+                    return
 
             yield "data: [DONE]\n\n"
             logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream", voice=voice_file,
-                        language=language, chunks_sent=chunks_sent, mode="token",
-                        chars=len(text), total_ms=round((time.perf_counter() - t_stream_start) * 1000),
-                        ).info("stream_complete")
-            return
-
-        # else: sentence-level streaming (existing code below, unchanged)
-        def _make_synth_fn(s, gk):
-            return lambda: _do_synthesize(s, language, voice_file, gk)
-
-        # Pre-fetch: submit first sentence immediately
-        pending_future = None
-        sentence_idx = 0
-
-        if sentences:
-            gk = _build_gen_kwargs(sentences[0], request)
-            pending_future = asyncio.ensure_future(
-                asyncio.wait_for(
-                    _infer_queue.submit(
-                        _make_synth_fn(sentences[0], gk),
-                        priority=PRIORITY_REALTIME,
-                    ),
-                    timeout=REQUEST_TIMEOUT,
-                )
-            )
-
-        while sentence_idx < len(sentences):
-            try:
-                t_sent = time.perf_counter()
-                wavs, sr_val = await pending_future
-
-                # Pre-fetch next sentence while we process current
-                next_idx = sentence_idx + 1
-                if next_idx < len(sentences):
-                    gk_next = _build_gen_kwargs(sentences[next_idx], request)
-                    pending_future = asyncio.ensure_future(
-                        asyncio.wait_for(
-                            _infer_queue.submit(
-                                _make_synth_fn(sentences[next_idx], gk_next),
-                                priority=PRIORITY_REALTIME,
-                            ),
-                            timeout=REQUEST_TIMEOUT,
-                        )
-                    )
-
-                audio_data = np.array(wavs[0], dtype=np.float32, copy=True)
-                if audio_data.ndim > 1:
-                    audio_data = audio_data.squeeze()
-
-                if request.speed != 1.0:
-                    new_length = int(len(audio_data) / request.speed)
-                    if new_length > 0:
-                        audio_data = scipy_signal.resample(audio_data, new_length)
-
-                if request.sample_rate:
-                    audio_data = _resample_audio(audio_data, sr_val, request.sample_rate)
-
-                audio_int16 = (audio_data * 32767).astype(np.int16)
-                pcm_bytes = audio_int16.tobytes()
-                yield f"data: {base64.b64encode(pcm_bytes).decode()}\n\n"
-                logger.bind(
-                    request_id=request_id,
-                    sentence_idx=chunks_sent,
-                    chars=len(sentences[sentence_idx]),
-                    ms=round((time.perf_counter() - t_sent) * 1000),
-                ).debug("sentence_synthesized")
-                chunks_sent += 1
-                sentence_idx += 1
-
-                _last_used = time.time()
-
-            except asyncio.TimeoutError:
-                logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream", voice=voice_file,
-                             chunks_sent=chunks_sent, timeout_s=REQUEST_TIMEOUT).error("Stream synthesis timed out")
-                yield "data: [ERROR] Synthesis timed out\n\n"
-                return
-            except Exception as e:
-                logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream", voice=voice_file,
-                             chunks_sent=chunks_sent).opt(exception=True).error("Stream synthesis failed")
-                yield f"data: [ERROR] {str(e)}\n\n"
-                return
-
-        yield "data: [DONE]\n\n"
-        logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream", voice=voice_file,
-                     language=language, sentences=len(sentences), chunks_sent=chunks_sent,
-                     chars=len(text), total_ms=round((time.perf_counter() - t_stream_start) * 1000),
-                     ).info("stream_complete")
+                         language=language, sentences=len(sentences), chunks_sent=chunks_sent,
+                         chars=len(text), total_ms=round((time.perf_counter() - t_stream_start) * 1000),
+                         ).info("stream_complete")
+        finally:
+            await _queue_tracker.release()
 
     return StreamingResponse(
         generate(),
@@ -1533,27 +1712,18 @@ async def clone_voice(
     response_format: str = Form("wav"),
     temperature: Optional[float] = Form(None),
     top_p: Optional[float] = Form(None),
-):
+) -> Response:
     """Voice cloning endpoint - requires a reference audio file."""
-    global _queue_depth
-
     request_id = str(uuid.uuid4())[:8]
     t_start = time.perf_counter()
-
-    if MAX_QUEUE_DEPTH > 0 and _queue_depth >= MAX_QUEUE_DEPTH:
-        logger.bind(request_id=request_id, endpoint="/v1/audio/speech/clone",
-                     queue_depth=_queue_depth).warning("Request rejected: queue full")
-        raise APIError(503, "QUEUE_FULL",
-                       f"Server busy: {_queue_depth} requests queued. Try again later.",
-                       headers={"Retry-After": "5"})
-
-    await _ensure_model_loaded()
 
     if not input or not input.strip():
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech/clone").warning("Request rejected: empty input")
         raise APIError(400, "EMPTY_INPUT", "Input text is required")
 
-    _queue_depth += 1
+    await _queue_tracker.acquire(request_id, "/v1/audio/speech/clone")
+    await _ensure_model_loaded()
+
     try:
         # Read reference audio and compute/cache speaker embedding
         audio_bytes = await file.read()
@@ -1597,9 +1767,9 @@ async def clone_voice(
         logger.bind(
             request_id=request_id,
             endpoint="/v1/audio/speech/clone",
-            inference_ms=round((t_infer_end - t_infer_start) * 1000, 1),
-            encode_ms=round((t_end - t_infer_end) * 1000, 1),
-            total_ms=round((t_end - t_start) * 1000, 1),
+            infer_ms=round((t_infer_end - t_infer_start) * 1000),
+            encode_ms=round((t_end - t_infer_end) * 1000),
+            total_ms=round((t_end - t_start) * 1000),
             chars=len(text),
             format=response_format,
             language=language,
@@ -1624,11 +1794,11 @@ async def clone_voice(
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech/clone").opt(exception=True).error("Voice clone failed")
         raise APIError(500, "CLONE_FAILED", f"Voice clone failed: {str(e)}")
     finally:
-        _queue_depth -= 1
+        await _queue_tracker.release()
 
 
 @app.post("/v1/audio/speech/stream/pcm")
-async def synthesize_speech_stream_pcm(request: TTSRequest):
+async def synthesize_speech_stream_pcm(request: TTSRequest) -> StreamingResponse:
     """Raw PCM streaming TTS endpoint — no SSE framing, no base64.
 
     Splits text into sentences and streams each as raw int16 PCM bytes.
@@ -1637,8 +1807,10 @@ async def synthesize_speech_stream_pcm(request: TTSRequest):
     global _last_used
     request_id = str(uuid.uuid4())[:8]
     await _ensure_model_loaded()
+    await _queue_tracker.acquire(request_id, "/v1/audio/speech/stream/pcm")
 
     if not request.input or not request.input.strip():
+        await _queue_tracker.release()
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm").warning("Request rejected: empty input")
         raise APIError(400, "EMPTY_INPUT", "Input text is required")
 
@@ -1647,20 +1819,94 @@ async def synthesize_speech_stream_pcm(request: TTSRequest):
     text = request.input.strip()
     sentences = _split_sentences(text)
     if not sentences:
+        await _queue_tracker.release()
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm").warning("Request rejected: no sentences")
         raise APIError(400, "NO_SENTENCES", "No sentences found in input")
 
     async def pcm_generator():
         global _last_used
-        t_pcm_start = time.perf_counter()
-        chunks_sent = 0
+        try:
+            t_pcm_start = time.perf_counter()
+            chunks_sent = 0
 
-        if STREAM_TYPE == "token":
-            gen_kwargs = _build_gen_kwargs(text, request)
-            try:
-                async for chunk, sr_val in _stream_synthesize(text, language, voice_file, gen_kwargs):
+            if STREAM_TYPE == "token":
+                gen_kwargs = _build_gen_kwargs(text, request)
+                try:
+                    async for chunk, sr_val in _stream_synthesize(text, language, voice_file, gen_kwargs):
+                        _last_used = time.time()
+                        audio_data = np.array(chunk, dtype=np.float32, copy=True)
+                        if audio_data.ndim > 1:
+                            audio_data = audio_data.squeeze()
+                        audio_data = _adjust_speed(audio_data, sr_val, request.speed)
+                        if request.sample_rate:
+                            audio_data = _resample_audio(audio_data, sr_val, request.sample_rate)
+                        pcm_data = np.clip(audio_data, -1.0, 1.0)
+                        pcm_bytes = (pcm_data * 32767).astype(np.int16).tobytes()
+                        yield pcm_bytes
+                        t_now = time.perf_counter()
+                        logger.bind(
+                            request_id=request_id,
+                            chunk_idx=chunks_sent,
+                            ms=round((t_now - t_pcm_start) * 1000) if chunks_sent == 0 else None,
+                            ttfc_ms=round((t_now - t_pcm_start) * 1000) if chunks_sent == 0 else None,
+                        ).info("token_chunk_sent")
+                        chunks_sent += 1
+                except asyncio.TimeoutError:
+                    logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm",
+                                chunks_sent=chunks_sent).error("Token PCM stream timed out")
+                    return
+                except Exception:
+                    logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm",
+                                chunks_sent=chunks_sent).opt(exception=True).error("Token PCM stream failed")
+                    return
+
+                logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm", voice=voice_file,
+                            language=language, chunks_sent=chunks_sent, mode="token",
+                            chars=len(text), total_ms=round((time.perf_counter() - t_pcm_start) * 1000),
+                            ).info("pcm_stream_complete")
+                return
+
+            # else: sentence-level (existing code below, unchanged)
+            def _make_synth_fn(s, gk):
+                return lambda: _do_synthesize(s, language, voice_file, gk)
+
+            # Pre-fetch: submit first sentence immediately
+            pending_future = None
+            sentence_idx = 0
+
+            if sentences:
+                gk = _build_gen_kwargs(sentences[0], request)
+                pending_future = asyncio.ensure_future(
+                    asyncio.wait_for(
+                        _infer_queue.submit(
+                            _make_synth_fn(sentences[0], gk),
+                            priority=PRIORITY_REALTIME,
+                        ),
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                )
+
+            while sentence_idx < len(sentences):
+                try:
+                    t_sent = time.perf_counter()
+                    wavs, sr_val = await pending_future
+
+                    # Pre-fetch next sentence while we process current
+                    next_idx = sentence_idx + 1
+                    if next_idx < len(sentences):
+                        gk_next = _build_gen_kwargs(sentences[next_idx], request)
+                        pending_future = asyncio.ensure_future(
+                            asyncio.wait_for(
+                                _infer_queue.submit(
+                                    _make_synth_fn(sentences[next_idx], gk_next),
+                                    priority=PRIORITY_REALTIME,
+                                ),
+                                timeout=REQUEST_TIMEOUT,
+                            )
+                        )
+
                     _last_used = time.time()
-                    audio_data = np.array(chunk, dtype=np.float32, copy=True)
+                    audio_data = np.array(wavs[0], dtype=np.float32, copy=True)
                     if audio_data.ndim > 1:
                         audio_data = audio_data.squeeze()
                     audio_data = _adjust_speed(audio_data, sr_val, request.speed)
@@ -1669,96 +1915,33 @@ async def synthesize_speech_stream_pcm(request: TTSRequest):
                     pcm_data = np.clip(audio_data, -1.0, 1.0)
                     pcm_bytes = (pcm_data * 32767).astype(np.int16).tobytes()
                     yield pcm_bytes
-                    t_now = time.perf_counter()
+                    sent_ms = round((time.perf_counter() - t_sent) * 1000)
                     logger.bind(
                         request_id=request_id,
-                        chunk_idx=chunks_sent,
-                        ms=round((t_now - t_pcm_start) * 1000) if chunks_sent == 0 else None,
-                        ttfc_ms=round((t_now - t_pcm_start) * 1000) if chunks_sent == 0 else None,
-                    ).info("token_chunk_sent")
+                        sentence_idx=chunks_sent,
+                        sentences_total=len(sentences),
+                        chars=len(sentences[sentence_idx]),
+                        ms=sent_ms,
+                        ttfs_ms=round((time.perf_counter() - t_pcm_start) * 1000) if chunks_sent == 0 else None,
+                    ).info("sentence_synthesized")
                     chunks_sent += 1
-            except asyncio.TimeoutError:
-                logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm",
-                            chunks_sent=chunks_sent).error("Token PCM stream timed out")
-                return
-            except Exception:
-                logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm",
-                            chunks_sent=chunks_sent).opt(exception=True).error("Token PCM stream failed")
-                return
+                    sentence_idx += 1
+
+                except asyncio.TimeoutError:
+                    logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm", voice=voice_file,
+                                 chunks_sent=chunks_sent, timeout_s=REQUEST_TIMEOUT).error("PCM stream timed out")
+                    break
+                except Exception:
+                    logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm", voice=voice_file,
+                                 chunks_sent=chunks_sent).opt(exception=True).error("PCM stream failed")
+                    break
 
             logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm", voice=voice_file,
-                        language=language, chunks_sent=chunks_sent, mode="token",
-                        chars=len(text), total_ms=round((time.perf_counter() - t_pcm_start) * 1000),
-                        ).info("pcm_stream_complete")
-            return
-
-        # else: sentence-level (existing code below, unchanged)
-        def _make_synth_fn(s, gk):
-            return lambda: _do_synthesize(s, language, voice_file, gk)
-
-        # Pre-fetch: submit first sentence immediately
-        pending_future = None
-        sentence_idx = 0
-
-        if sentences:
-            gk = _build_gen_kwargs(sentences[0], request)
-            pending_future = asyncio.ensure_future(
-                asyncio.wait_for(
-                    _infer_queue.submit(
-                        _make_synth_fn(sentences[0], gk),
-                        priority=PRIORITY_REALTIME,
-                    ),
-                    timeout=REQUEST_TIMEOUT,
-                )
-            )
-
-        while sentence_idx < len(sentences):
-            try:
-                wavs, sr_val = await pending_future
-
-                # Pre-fetch next sentence while we process current
-                next_idx = sentence_idx + 1
-                if next_idx < len(sentences):
-                    gk_next = _build_gen_kwargs(sentences[next_idx], request)
-                    pending_future = asyncio.ensure_future(
-                        asyncio.wait_for(
-                            _infer_queue.submit(
-                                _make_synth_fn(sentences[next_idx], gk_next),
-                                priority=PRIORITY_REALTIME,
-                            ),
-                            timeout=REQUEST_TIMEOUT,
-                        )
-                    )
-
-                _last_used = time.time()
-                audio_data = np.array(wavs[0], dtype=np.float32, copy=True)
-                if audio_data.ndim > 1:
-                    audio_data = audio_data.squeeze()
-                if request.speed != 1.0:
-                    new_length = int(len(audio_data) / request.speed)
-                    if new_length > 0:
-                        audio_data = scipy_signal.resample(audio_data, new_length)
-                if request.sample_rate:
-                    audio_data = _resample_audio(audio_data, sr_val, request.sample_rate)
-                pcm_data = np.clip(audio_data, -1.0, 1.0)
-                pcm_bytes = (pcm_data * 32767).astype(np.int16).tobytes()
-                yield pcm_bytes
-                chunks_sent += 1
-                sentence_idx += 1
-
-            except asyncio.TimeoutError:
-                logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm", voice=voice_file,
-                             chunks_sent=chunks_sent, timeout_s=REQUEST_TIMEOUT).error("PCM stream timed out")
-                break
-            except Exception:
-                logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm", voice=voice_file,
-                             chunks_sent=chunks_sent).opt(exception=True).error("PCM stream failed")
-                break
-
-        logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm", voice=voice_file,
-                     language=language, sentences=len(sentences), chunks_sent=chunks_sent,
-                     chars=len(text), total_ms=round((time.perf_counter() - t_pcm_start) * 1000),
-                     ).info("pcm_stream_complete")
+                         language=language, sentences=len(sentences), chunks_sent=chunks_sent,
+                         chars=len(text), total_ms=round((time.perf_counter() - t_pcm_start) * 1000),
+                         ).info("pcm_stream_complete")
+        finally:
+            await _queue_tracker.release()
 
     pcm_sr = request.sample_rate or 24000
     return StreamingResponse(
@@ -1774,7 +1957,7 @@ async def synthesize_speech_stream_pcm(request: TTSRequest):
 
 
 @app.websocket("/v1/audio/speech/ws")
-async def ws_synthesize(websocket: WebSocket):
+async def ws_synthesize(websocket: WebSocket) -> None:
     """WebSocket streaming endpoint. Send JSON, receive binary PCM per sentence."""
     global _last_used
     ws_id = str(uuid.uuid4())[:8]
@@ -1800,99 +1983,109 @@ async def ws_synthesize(websocket: WebSocket):
             ws_top_p = data.get("top_p")
 
             await _ensure_model_loaded()
+            await _queue_tracker.acquire(request_id, "/v1/audio/speech/ws")
 
-            def _ws_build_gen_kwargs(s):
-                gk = {"max_new_tokens": _adaptive_max_tokens(s)}
-                if ws_temperature is not None:
-                    gk["temperature"] = float(ws_temperature)
-                if ws_top_p is not None:
-                    gk["top_p"] = float(ws_top_p)
-                return gk
+            try:
+                def _ws_build_gen_kwargs(s):
+                    gk = {"max_new_tokens": _adaptive_max_tokens(s)}
+                    if ws_temperature is not None:
+                        gk["temperature"] = float(ws_temperature)
+                    if ws_top_p is not None:
+                        gk["top_p"] = float(ws_top_p)
+                    return gk
 
-            if STREAM_TYPE == "token":
-                # Per-token streaming — no sentence splitting
-                ws_gen_kwargs = _ws_build_gen_kwargs(text)
-                t_ws_token_start = time.perf_counter()
-                chunk_count = 0
-                async for chunk, sr_val in _stream_synthesize(text, language, voice_file, ws_gen_kwargs):
-                    audio_data = np.array(chunk, dtype=np.float32, copy=True)
-                    if audio_data.ndim > 1:
-                        audio_data = audio_data.squeeze()
-                    audio_data = _adjust_speed(audio_data, sr_val, speed)
-                    if ws_sample_rate:
-                        audio_data = _resample_audio(audio_data, sr_val, int(ws_sample_rate))
-                    pcm = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-                    await websocket.send_bytes(pcm)
-                    _last_used = time.time()
-                    logger.bind(
-                        request_id=request_id, ws_id=ws_id,
-                        chunk_idx=chunk_count,
-                        ms=round((time.perf_counter() - t_ws_token_start) * 1000) if chunk_count == 0 else None,
-                    ).info("ws_token_chunk_sent")
-                    chunk_count += 1
-                await websocket.send_json({"event": "done"})
-                messages_handled += 1
-                continue  # skip sentence-level code below
+                if STREAM_TYPE == "token":
+                    # Per-token streaming — no sentence splitting
+                    ws_gen_kwargs = _ws_build_gen_kwargs(text)
+                    t_ws_token_start = time.perf_counter()
+                    chunk_count = 0
+                    async for chunk, sr_val in _stream_synthesize(text, language, voice_file, ws_gen_kwargs):
+                        audio_data = np.array(chunk, dtype=np.float32, copy=True)
+                        if audio_data.ndim > 1:
+                            audio_data = audio_data.squeeze()
+                        audio_data = _adjust_speed(audio_data, sr_val, speed)
+                        if ws_sample_rate:
+                            audio_data = _resample_audio(audio_data, sr_val, int(ws_sample_rate))
+                        pcm = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                        await websocket.send_bytes(pcm)
+                        _last_used = time.time()
+                        logger.bind(
+                            request_id=request_id, ws_id=ws_id,
+                            chunk_idx=chunk_count,
+                            ms=round((time.perf_counter() - t_ws_token_start) * 1000) if chunk_count == 0 else None,
+                        ).info("ws_token_chunk_sent")
+                        chunk_count += 1
+                    await websocket.send_json({"event": "done"})
+                    messages_handled += 1
+                    continue  # skip sentence-level code below
 
-            sentences = _split_sentences(text)
-            if not sentences:
-                sentences = [text]
+                sentences = _split_sentences(text)
+                if not sentences:
+                    sentences = [text]
 
-            def _ws_make_synth_fn(s, gk):
-                return lambda: _do_synthesize(s, language, voice_file, gk)
+                def _ws_make_synth_fn(s, gk):
+                    return lambda: _do_synthesize(s, language, voice_file, gk)
 
-            # Pre-fetch: submit first sentence immediately
-            pending_future = None
-            sentence_idx = 0
+                # Pre-fetch: submit first sentence immediately
+                pending_future = None
+                sentence_idx = 0
 
-            if sentences:
-                gk = _ws_build_gen_kwargs(sentences[0])
-                pending_future = asyncio.ensure_future(
-                    asyncio.wait_for(
-                        _infer_queue.submit(
-                            _ws_make_synth_fn(sentences[0], gk),
-                            priority=PRIORITY_REALTIME,
-                        ),
-                        timeout=REQUEST_TIMEOUT,
-                    )
-                )
-
-            while sentence_idx < len(sentences):
-                wavs, sr_val = await pending_future
-
-                # Pre-fetch next sentence while we process current
-                next_idx = sentence_idx + 1
-                if next_idx < len(sentences):
-                    gk_next = _ws_build_gen_kwargs(sentences[next_idx])
+                if sentences:
+                    gk = _ws_build_gen_kwargs(sentences[0])
                     pending_future = asyncio.ensure_future(
                         asyncio.wait_for(
                             _infer_queue.submit(
-                                _ws_make_synth_fn(sentences[next_idx], gk_next),
+                                _ws_make_synth_fn(sentences[0], gk),
                                 priority=PRIORITY_REALTIME,
                             ),
                             timeout=REQUEST_TIMEOUT,
                         )
                     )
 
-                audio_data = np.array(wavs[0], dtype=np.float32, copy=True)
-                if audio_data.ndim > 1:
-                    audio_data = audio_data.squeeze()
+                while sentence_idx < len(sentences):
+                    t_sent = time.perf_counter()
+                    wavs, sr_val = await pending_future
 
-                if speed != 1.0:
-                    new_length = int(len(audio_data) / speed)
-                    if new_length > 0:
-                        audio_data = scipy_signal.resample(audio_data, new_length)
+                    # Pre-fetch next sentence while we process current
+                    next_idx = sentence_idx + 1
+                    if next_idx < len(sentences):
+                        gk_next = _ws_build_gen_kwargs(sentences[next_idx])
+                        pending_future = asyncio.ensure_future(
+                            asyncio.wait_for(
+                                _infer_queue.submit(
+                                    _ws_make_synth_fn(sentences[next_idx], gk_next),
+                                    priority=PRIORITY_REALTIME,
+                                ),
+                                timeout=REQUEST_TIMEOUT,
+                            )
+                        )
 
-                if ws_sample_rate:
-                    audio_data = _resample_audio(audio_data, sr_val, int(ws_sample_rate))
+                    audio_data = np.array(wavs[0], dtype=np.float32, copy=True)
+                    if audio_data.ndim > 1:
+                        audio_data = audio_data.squeeze()
 
-                pcm = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-                await websocket.send_bytes(pcm)
-                _last_used = time.time()
-                sentence_idx += 1
+                    audio_data = _adjust_speed(audio_data, sr_val, speed)
 
-            await websocket.send_json({"event": "done"})
-            messages_handled += 1
+                    if ws_sample_rate:
+                        audio_data = _resample_audio(audio_data, sr_val, int(ws_sample_rate))
+
+                    pcm = (np.clip(audio_data, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                    await websocket.send_bytes(pcm)
+                    _last_used = time.time()
+                    logger.bind(
+                        request_id=request_id,
+                        ws_id=ws_id,
+                        sentence_idx=sentence_idx,
+                        sentences_total=len(sentences),
+                        chars=len(sentences[sentence_idx]),
+                        ms=round((time.perf_counter() - t_sent) * 1000),
+                    ).info("sentence_synthesized")
+                    sentence_idx += 1
+
+                await websocket.send_json({"event": "done"})
+                messages_handled += 1
+            finally:
+                await _queue_tracker.release()
     except WebSocketDisconnect:
         logger.bind(request_id=request_id, ws_id=ws_id, messages=messages_handled,
                      duration_ms=round((time.perf_counter() - t_ws_start) * 1000)).info("WebSocket disconnected")

@@ -18,7 +18,7 @@ _mock_modules = {
 
 with patch.dict("sys.modules", _mock_modules):
     from server import (
-        _trim_silence, _normalize_text, _expand_currency,
+        _normalize_text, _expand_currency,
         _detect_language_unicode, _get_langdetect, detect_language,
         _adjust_speed, _resample_audio, resolve_voice, _LANG_MAP,
         _get_cached_voice_prompt, _split_sentences, _adaptive_max_tokens,
@@ -27,65 +27,6 @@ with patch.dict("sys.modules", _mock_modules):
         APIError, ErrorResponse,
     )
     import server
-
-
-# --- Issue #11: VAD silence trimming tests ---
-
-class TestTrimSilence:
-    def test_trim_silence_removes_leading_silence(self):
-        sr = 24000
-        silence = np.zeros(sr)
-        speech = np.random.randn(sr).astype(np.float32) * 0.5
-        audio = np.concatenate([silence, speech])
-        with patch.object(server, "VAD_TRIM", True):
-            result = _trim_silence(audio, sr)
-        assert len(result) < len(audio)
-        assert len(result) >= len(speech)
-
-    def test_trim_silence_removes_trailing_silence(self):
-        sr = 24000
-        speech = np.random.randn(sr).astype(np.float32) * 0.5
-        silence = np.zeros(sr)
-        audio = np.concatenate([speech, silence])
-        with patch.object(server, "VAD_TRIM", True):
-            result = _trim_silence(audio, sr)
-        assert len(result) < len(audio)
-        assert len(result) >= len(speech)
-
-    def test_trim_silence_preserves_content(self):
-        sr = 24000
-        speech = np.random.randn(sr).astype(np.float32) * 0.5
-        with patch.object(server, "VAD_TRIM", True):
-            result = _trim_silence(speech.copy(), sr)
-        assert len(result) >= len(speech) - int(0.05 * sr)
-
-    def test_trim_silence_all_silence_returns_original(self):
-        sr = 24000
-        audio = np.zeros(sr, dtype=np.float32)
-        with patch.object(server, "VAD_TRIM", True):
-            result = _trim_silence(audio, sr)
-        np.testing.assert_array_equal(result, audio)
-
-    def test_trim_silence_disabled_returns_original(self):
-        sr = 24000
-        silence = np.zeros(sr)
-        speech = np.random.randn(sr).astype(np.float32) * 0.5
-        audio = np.concatenate([silence, speech, silence])
-        with patch.object(server, "VAD_TRIM", False):
-            result = _trim_silence(audio, sr)
-        np.testing.assert_array_equal(result, audio)
-
-    def test_trim_silence_adds_padding(self):
-        sr = 24000
-        pad_samples = int(0.05 * sr)
-        silence = np.zeros(sr * 2)
-        spike = np.zeros(100, dtype=np.float32)
-        spike[50] = 1.0
-        audio = np.concatenate([silence, spike, silence])
-        with patch.object(server, "VAD_TRIM", True):
-            result = _trim_silence(audio, sr)
-        assert len(result) >= len(spike)
-        assert len(result) <= len(spike) + 2 * pad_samples
 
 
 # --- Issue #12: Text normalization tests ---
@@ -492,23 +433,23 @@ def _make_wav_bytes(samples=None, sr=24000, channels=1):
 # --- Issue #16: GPU memory pool pre-allocation tests ---
 
 class TestGpuPoolPreAllocation:
-    """Verify GPU memory pool pre-warming code exists in _load_model_sync."""
+    """Verify GPU memory pool pre-warming code exists in _gpu_warmup."""
 
-    def test_load_model_contains_pool_prewarm(self):
+    def test_gpu_warmup_contains_pool_prewarm(self):
         import inspect
-        source = inspect.getsource(server._load_model_sync)
+        source = inspect.getsource(server._gpu_warmup)
         assert "Pre-warming CUDA memory pool" in source
         assert "torch.empty" in source
         assert "dtype=torch.bfloat16" in source
 
     def test_dummy_tensor_size_is_128mb(self):
         import inspect
-        source = inspect.getsource(server._load_model_sync)
+        source = inspect.getsource(server._gpu_warmup)
         assert "64 * 1024 * 1024" in source
 
     def test_pool_prewarm_has_exception_handling(self):
         import inspect
-        source = inspect.getsource(server._load_model_sync)
+        source = inspect.getsource(server._gpu_warmup)
         idx = source.find("Pre-warming CUDA memory pool")
         assert idx > 0
         section = source[idx - 200:idx + 500]
@@ -517,7 +458,7 @@ class TestGpuPoolPreAllocation:
 
     def test_pool_prewarm_after_warmup(self):
         import inspect
-        source = inspect.getsource(server._load_model_sync)
+        source = inspect.getsource(server._gpu_warmup)
         warmup_idx = source.find("Warming up GPU with multi-length synthesis")
         pool_idx = source.find("Pre-warming CUDA memory pool")
         assert warmup_idx > 0
@@ -526,9 +467,14 @@ class TestGpuPoolPreAllocation:
 
     def test_dummy_tensor_is_deleted(self):
         import inspect
-        source = inspect.getsource(server._load_model_sync)
+        source = inspect.getsource(server._gpu_warmup)
         pool_section = source[source.find("Pre-warming CUDA memory pool"):]
         assert "del dummy" in pool_section
+
+    def test_load_model_calls_gpu_warmup(self):
+        import inspect
+        source = inspect.getsource(server._load_model_sync)
+        assert "_gpu_warmup()" in source
 
 
 class TestDetectLanguage:

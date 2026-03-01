@@ -22,8 +22,11 @@ ENV MALLOC_CONF=background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git libsndfile1 ffmpeg sox rubberband-cli libjemalloc2 libopus-dev \
+    git libsndfile1 ffmpeg sox rubberband-cli libjemalloc2 libopus-dev curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Run as non-root user
+RUN groupadd -r tts && useradd -r -g tts -d /app tts
 
 # Install Python dependencies
 COPY requirements.txt /tmp/requirements.txt
@@ -53,6 +56,12 @@ COPY server.py /app/server.py
 COPY gateway.py /app/gateway.py
 COPY worker.py /app/worker.py
 COPY voices/ /app/voices/
+
+# HuggingFace cache directory — writable by non-root user
+ENV HF_HOME=/app/cache
+RUN mkdir -p /app/cache && chown -R tts:tts /app
+
+USER tts
 
 EXPOSE 8000
 
