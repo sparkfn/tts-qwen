@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager, nullcontext
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional
 import torch
 import soundfile as sf
@@ -578,6 +578,18 @@ class TTSRequest(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     sample_rate: Optional[int] = None
+    stream_mode: Optional[str] = None
+
+    @field_validator("stream_mode")
+    @classmethod
+    def _validate_stream_mode(cls, v):
+        if v is not None and v not in ("sentence", "token"):
+            raise ValueError(f"stream_mode must be 'sentence' or 'token', got '{v}'")
+        return v
+
+
+def _effective_stream_mode(request: TTSRequest) -> str:
+    return request.stream_mode or STREAM_TYPE
 
 
 def _release_gpu_full():
@@ -1563,12 +1575,18 @@ async def synthesize_speech_stream(request: TTSRequest) -> StreamingResponse:
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream").warning("Request rejected: no sentences")
         raise APIError(400, "NO_SENTENCES", "No sentences found in input")
 
+    effective_mode = _effective_stream_mode(request)
+    if effective_mode == "token" and not _HAS_STREAMING:
+        await _queue_tracker.release()
+        raise APIError(400, "TOKEN_STREAMING_UNAVAILABLE",
+                       "stream_mode='token' requires the streaming TTS fork")
+
     async def generate():
         try:
             t_stream_start = time.perf_counter()
             chunks_sent = 0
 
-            if STREAM_TYPE == "token":
+            if effective_mode == "token":
                 # Per-token streaming — full text, no sentence splitting
                 gen_kwargs = _build_gen_kwargs(text, request)
                 try:
@@ -1604,7 +1622,7 @@ async def synthesize_speech_stream(request: TTSRequest) -> StreamingResponse:
 
                 yield "data: [DONE]\n\n"
                 logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream", voice=voice_file,
-                            language=language, chunks_sent=chunks_sent, mode="token",
+                            language=language, chunks_sent=chunks_sent, mode=effective_mode,
                             chars=len(text), total_ms=round((time.perf_counter() - t_stream_start) * 1000),
                             ).info("stream_complete")
                 return
@@ -1823,13 +1841,19 @@ async def synthesize_speech_stream_pcm(request: TTSRequest) -> StreamingResponse
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm").warning("Request rejected: no sentences")
         raise APIError(400, "NO_SENTENCES", "No sentences found in input")
 
+    effective_mode = _effective_stream_mode(request)
+    if effective_mode == "token" and not _HAS_STREAMING:
+        await _queue_tracker.release()
+        raise APIError(400, "TOKEN_STREAMING_UNAVAILABLE",
+                       "stream_mode='token' requires the streaming TTS fork")
+
     async def pcm_generator():
         global _last_used
         try:
             t_pcm_start = time.perf_counter()
             chunks_sent = 0
 
-            if STREAM_TYPE == "token":
+            if effective_mode == "token":
                 gen_kwargs = _build_gen_kwargs(text, request)
                 try:
                     async for chunk, sr_val in _stream_synthesize(text, language, voice_file, gen_kwargs):
@@ -1861,7 +1885,7 @@ async def synthesize_speech_stream_pcm(request: TTSRequest) -> StreamingResponse
                     return
 
                 logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream/pcm", voice=voice_file,
-                            language=language, chunks_sent=chunks_sent, mode="token",
+                            language=language, chunks_sent=chunks_sent, mode=effective_mode,
                             chars=len(text), total_ms=round((time.perf_counter() - t_pcm_start) * 1000),
                             ).info("pcm_stream_complete")
                 return
@@ -1981,6 +2005,10 @@ async def ws_synthesize(websocket: WebSocket) -> None:
             ws_sample_rate = data.get("sample_rate")
             ws_temperature = data.get("temperature")
             ws_top_p = data.get("top_p")
+            ws_stream_mode = data.get("stream_mode")
+            if ws_stream_mode is not None and ws_stream_mode not in ("sentence", "token"):
+                await websocket.send_json({"event": "error", "detail": "stream_mode must be 'sentence' or 'token'"})
+                continue
 
             await _ensure_model_loaded()
             await _queue_tracker.acquire(request_id, "/v1/audio/speech/ws")
@@ -1994,7 +2022,12 @@ async def ws_synthesize(websocket: WebSocket) -> None:
                         gk["top_p"] = float(ws_top_p)
                     return gk
 
-                if STREAM_TYPE == "token":
+                effective_mode = ws_stream_mode or STREAM_TYPE
+                if effective_mode == "token" and not _HAS_STREAMING:
+                    await websocket.send_json({"event": "error", "detail": "stream_mode='token' requires the streaming TTS fork"})
+                    await _queue_tracker.release()
+                    continue
+                if effective_mode == "token":
                     # Per-token streaming — no sentence splitting
                     ws_gen_kwargs = _ws_build_gen_kwargs(text)
                     t_ws_token_start = time.perf_counter()

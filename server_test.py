@@ -6,6 +6,7 @@ import hashlib
 import asyncio
 import time
 import threading
+import unittest
 import pytest
 import torch
 import numpy as np
@@ -26,7 +27,7 @@ with patch.dict("sys.modules", _mock_modules):
         _get_cached_voice_prompt, _split_sentences, _adaptive_max_tokens,
         _audio_cache_key, _get_audio_cache, _set_audio_cache,
         _audio_cache, _AUDIO_CACHE_MAX, _build_gen_kwargs,
-        APIError, ErrorResponse,
+        APIError, ErrorResponse, _effective_stream_mode,
     )
     import server
 
@@ -1198,3 +1199,39 @@ class TestStreamSynthesizeDeadlockPrevention:
         assert len(chunks_received) == 1
         assert len(errors_received) == 1
         assert "GPU OOM" in errors_received[0]
+
+
+class TestStreamMode(unittest.TestCase):
+    def test_valid_token_mode(self):
+        req = server.TTSRequest(input="hello", stream_mode="token")
+        assert req.stream_mode == "token"
+
+    def test_valid_sentence_mode(self):
+        req = server.TTSRequest(input="hello", stream_mode="sentence")
+        assert req.stream_mode == "sentence"
+
+    def test_none_default(self):
+        req = server.TTSRequest(input="hello")
+        assert req.stream_mode is None
+
+    def test_invalid_mode_rejected(self):
+        with pytest.raises(Exception):
+            server.TTSRequest(input="hello", stream_mode="invalid")
+
+    def test_effective_mode_uses_request_token(self):
+        req = server.TTSRequest(input="hello", stream_mode="token")
+        assert server._effective_stream_mode(req) == "token"
+
+    def test_effective_mode_uses_request_sentence(self):
+        req = server.TTSRequest(input="hello", stream_mode="sentence")
+        assert server._effective_stream_mode(req) == "sentence"
+
+    @patch.object(server, "STREAM_TYPE", "sentence")
+    def test_effective_mode_falls_back_to_env_sentence(self):
+        req = server.TTSRequest(input="hello")
+        assert server._effective_stream_mode(req) == "sentence"
+
+    @patch.object(server, "STREAM_TYPE", "token")
+    def test_effective_mode_falls_back_to_env_token(self):
+        req = server.TTSRequest(input="hello")
+        assert server._effective_stream_mode(req) == "token"
