@@ -29,23 +29,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt && rm /tmp/requirements.txt
 
-# FlashAttention 2 — force source compilation matching PyTorch's CXX11 ABI=0.
-# RTX 4060 = sm_89 (Ada Lovelace) — only build for this arch.
-RUN FLASH_ATTENTION_FORCE_BUILD=TRUE \
-    TORCH_CUDA_ARCH_LIST="8.9" \
-    MAX_JOBS=2 \
-    pip install --no-cache-dir flash-attn --no-build-isolation
+# FlashAttention 2 is an optional optimization. The runtime automatically falls
+# back to PyTorch SDPA when it is absent. Keep installation explicit so a failed
+# compile never masquerades as a successful optimized image.
+ARG INSTALL_FLASH_ATTN=true
+RUN if [ "$INSTALL_FLASH_ATTN" = "true" ]; then \
+      FLASH_ATTENTION_FORCE_BUILD=TRUE \
+      TORCH_CUDA_ARCH_LIST="8.9" \
+      MAX_JOBS=2 \
+      pip install --no-cache-dir flash-attn==2.8.3.post1 --no-build-isolation; \
+    else \
+      echo "Building without FlashAttention; runtime will use SDPA"; \
+    fi
 
 # Optional quantization
-RUN pip install --no-cache-dir "bitsandbytes>=0.43.0" || true
+RUN pip install --no-cache-dir "bitsandbytes==0.49.2" || true
 # torchao for FP8 quantization (transformers 4.57+ expects this version's API)
-RUN pip install --no-cache-dir torchao || true
+RUN pip install --no-cache-dir torchao==0.16.0 || true
 
 # Streaming TTS fork — MUST be last pip install to override qwen-tts==0.1.1
 # from requirements.txt. Adds stream_generate_voice_clone() method.
 # No || true — this is required, fail the build if it doesn't install.
 RUN pip install --no-cache-dir --no-deps --force-reinstall \
-    "qwen-tts @ git+https://github.com/rekuenkdr/Qwen3-TTS-streaming.git"
+    "qwen-tts @ git+https://github.com/rekuenkdr/Qwen3-TTS-streaming.git@b8db6ff1cebc0d6554cf0977045850bcc796b383"
 
 # Copy application
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh

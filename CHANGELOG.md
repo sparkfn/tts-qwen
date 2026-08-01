@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.10.6 — 2026-08-01
+
+Prepare the standard KBN edge4 TTS runtime (#116).
+
+### Added
+- Explicit `model` request field and MP3 default for `/v1/audio/speech`
+- Strict input length, response format, speed, model, and unsupported-instructions validation before GPU work
+- Raw signed 16-bit little-endian PCM output
+- Kubernetes-oriented `/livez` and model-aware `/readyz` endpoints
+- `MAX_INPUT_CHARS` configuration (default 4000)
+
+### Changed
+- API failures now use the OpenAI `{"error": {...}}` envelope
+- Queue saturation returns HTTP 429 with `Retry-After` instead of 503
+- Required Python dependencies and the streaming fork are pinned to exact versions/commit
+- FlashAttention installation is an explicit Docker build argument; disabled images use the runtime SDPA fallback
+- Model loading reuses the existing prompt precompute and GPU warmup helpers
+
+### Fixed
+- Unsupported output formats no longer silently fall back to WAV
+- Queue depth release cannot underflow below zero
+- Input text previews were removed from warmup and language-detection logs
+- Internal synthesis and clone exception details are no longer returned to clients
+
+---
+
 ## v0.10.5 — 2026-03-02
 
 Fix silent streaming fork installation failure (#114).
