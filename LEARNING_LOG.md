@@ -608,3 +608,31 @@ HTTP/2 requires TLS in practice. While the spec defines h2c (cleartext HTTP/2), 
 **Related**: Issue #26
 
 UDS removes the TCP/IP stack overhead for same-host communication: no three-way handshake, no Nagle buffering, no checksumming. For a TTS server called by a local proxy or application, this saves 1-2ms per request (meaningful when the goal is sub-100ms time-to-first-byte for cached responses). The tradeoff: UDS and TCP are mutually exclusive — when `UNIX_SOCKET_PATH` is set, uvicorn binds only to the socket file, not to a TCP port. This means external clients cannot reach the service over the network. The intended deployment is behind a reverse proxy (nginx, caddy) that listens on TCP and forwards to the UDS. The `docker-entrypoint.sh` checks `UNIX_SOCKET_PATH` first and execs uvicorn with `--uds`, consolidating all startup logic in the entrypoint script.
+
+---
+
+## Entry 0023 — Compatibility belongs at the gateway boundary, capability belongs at the runtime
+**Date**: 2026-08-01
+**Type**: Why this design
+**Related**: #116, sparkfn/kbn-clusters#106
+
+The durable external contract is the OpenAI speech endpoint, not a model-specific Qwen schema. The runtime therefore declares the standard `model`, `input`, `voice`, `response_format`, `speed`, and `instructions` names, emits the standard nested error envelope, and fails unsupported capabilities explicitly. In particular, the 0.6B Base model cannot honor speaking instructions, so accepting and ignoring `instructions` would create false compatibility; a clear validation error is safer. The public `speech-tts` alias can later point at a different model without changing clients.
+
+The same rule applies to formats. Returning WAV bytes for an unsupported or unavailable MP3/Opus encoder makes the `Content-Type`, file extension, and client decoder disagree. Strict validation and encoder failure are preferable to a successful-looking corrupt contract. Raw PCM is implemented directly as clipped signed 16-bit little-endian samples, making its wire representation deterministic.
+
+Kubernetes readiness is intentionally stronger than process liveness: `/livez` proves the API event loop responds, while `/readyz` requires both CUDA and a loaded model. With `PRELOAD_MODEL=true`, traffic is withheld until cold model startup and warmup are complete.
+
+
+A native BuildKit build on the target Ada host also demonstrated why optional accelerator extensions must be explicit: FlashAttention source compilation exited `-11` before compiler output, while the service already had a correct SDPA fallback. The image build now takes `INSTALL_FLASH_ATTN`; disabling it is a recorded artifact property rather than a hidden `|| true` failure.
+---
+
+## Entry 0024 — A gateway-compatible API must be tested at the gateway, not inferred from the backend
+**Date**: 2026-08-01
+**Type**: What just happened
+**Related**: #116, sparkfn/kbn-clusters#106
+
+The runtime passed direct MP3, WAV, PCM, validation, and capacity tests, but the first public pass still exposed three LiteLLM 1.93.0 defects: every successful format was labeled `audio/mpeg`, mapped backend 4xx/429 failures escaped as 500, and missing required speech fields reached the router as Python `TypeError`. None of those failures could have been found by testing the FastAPI service alone. KBN fixed the exact pinned gateway with a narrow assertion-guarded startup patch while keeping authentication and routing in LiteLLM.
+
+The final release therefore treats the public path as the unit of compatibility. The official OpenAI SDK, five wire formats, error envelopes, immediate 429 backpressure, path restriction, persisted logging fields, 100 sequential requests, and a one-hour soak were all exercised through `speech.sparkfn.io`. The deployed 0.6B Base model used only 2.75 GiB peak VRAM on the RTX 4060 Ti during the burst, leaving substantially more than the required safety margin; the unstable RTX 3070 stayed at driver-idle memory.
+
+Another reproducibility lesson surfaced at closeout: pinning only the model repository name is not pinning the model. The production manifest now loads Hugging Face snapshot `5d83992436eae1d760afd27aff78a71d676296fc` from the node-local cache with offline mode enabled. That turns a successful warm restart into evidence for the same artifact, not merely the same mutable repository name.

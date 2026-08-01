@@ -9,7 +9,7 @@ OpenAI-compatible Text-to-Speech API server powered by [Qwen3-TTS-12Hz-0.6B-Base
 - **OpenAI voice aliases** — alloy, echo, fable, onyx, nova, shimmer
 - **Voice cloning** — generate speech from a reference audio sample
 - **Multi-language** — English, Chinese, Japanese, Korean, German, Italian, Portuguese, Spanish, French, Russian, Beijing dialect, Sichuan dialect
-- **Multiple output formats** — WAV, MP3, FLAC, OGG, Opus
+- **Standard output formats** — MP3 (default), WAV, raw PCM, FLAC, Opus
 - **Speed control** — adjustable playback speed via resampling
 - **Server-side resampling** — optional `sample_rate` parameter for telephony or custom sample rates
 - **Audio output cache** — LRU cache skips GPU entirely on repeated requests (~1ms vs 500ms+)
@@ -27,10 +27,12 @@ OpenAI-compatible Text-to-Speech API server powered by [Qwen3-TTS-12Hz-0.6B-Base
 docker compose up -d --build
 
 # Check health
-curl http://localhost:8101/health
+curl http://localhost:8101/readyz
 ```
 
 The model (~2.4 GB) downloads automatically on first startup.
+
+Docker builds install FlashAttention by default. For a reliability-first image that uses the built-in PyTorch SDPA fallback, build with `--build-arg INSTALL_FLASH_ATTN=false`.
 
 ## API Endpoints
 
@@ -41,22 +43,24 @@ Generate speech from text.
 ```bash
 curl -X POST http://localhost:8101/v1/audio/speech \
   -H "Content-Type: application/json" \
-  -d '{"input": "Hello, world!", "voice": "vivian"}' \
-  -o speech.wav
+  -d '{"model": "speech-tts", "input": "Hello, world!", "voice": "vivian"}' \
+  -o speech.mp3
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `input` | string | *required* | Text to synthesize |
+| `model` | string | `speech-tts` | Model or gateway alias; must be non-empty |
+| `input` | string | *required* | Non-empty text, bounded by `MAX_INPUT_CHARS` |
 | `voice` | string | `vivian` | Voice name or OpenAI alias |
-| `response_format` | string | `wav` | Output format: `wav`, `mp3`, `flac`, `ogg`, `opus` |
-| `speed` | float | `1.0` | Playback speed multiplier |
+| `response_format` | string | `mp3` | Output format: `mp3`, `wav`, `pcm`, `flac`, `opus` |
+| `speed` | float | `1.0` | Playback speed multiplier, 0.25–4.0 |
 | `language` | string | *auto-detect* | Language override |
-| `instruct` | string | *optional* | Accepted for backwards compatibility; ignored by Base model |
+| `instructions` / `instruct` | string | *unsupported* | Rejected because the Base model cannot honor instructions |
 | `temperature` | float | *optional* | Sampling temperature for generation |
 | `top_p` | float | *optional* | Nucleus sampling threshold |
 | `sample_rate` | int | *optional* | Server-side resampling (e.g. `8000` for telephony) |
 
+Errors use the OpenAI envelope: `{"error":{"message":"...","type":"invalid_request_error","param":"...","code":"..."}}`. Unsupported values are rejected before inference; the service never silently substitutes another audio format.
 
 ### `POST /v1/audio/speech/stream`
 
@@ -72,11 +76,12 @@ Each SSE event contains base64-encoded PCM data. The stream ends with `data: [DO
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `input` | string | *required* | Text to synthesize |
+| `model` | string | `speech-tts` | Model or gateway alias; must be non-empty |
+| `input` | string | *required* | Non-empty text, bounded by `MAX_INPUT_CHARS` |
 | `voice` | string | `vivian` | Voice name or OpenAI alias |
 | `speed` | float | `1.0` | Playback speed multiplier |
 | `language` | string | *auto-detect* | Language override |
-| `instruct` | string | *optional* | Accepted for backwards compatibility; ignored by Base model |
+| `instructions` / `instruct` | string | *unsupported* | Rejected because the Base model cannot honor instructions |
 | `temperature` | float | *optional* | Sampling temperature for generation |
 | `top_p` | float | *optional* | Nucleus sampling threshold |
 | `sample_rate` | int | *optional* | Server-side resampling (e.g. `8000` for telephony) |
@@ -128,7 +133,8 @@ asyncio.run(stream_tts())
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `input` | string | *required* | Text to synthesize |
+| `model` | string | `speech-tts` | Model or gateway alias; must be non-empty |
+| `input` | string | *required* | Non-empty text, bounded by `MAX_INPUT_CHARS` |
 | `voice` | string | `vivian` | Voice name or OpenAI alias |
 | `language` | string | *auto-detect* | Language override |
 | `speed` | float | `1.0` | Playback speed multiplier |
@@ -158,9 +164,11 @@ curl -X POST http://localhost:8101/v1/audio/speech/clone \
 | `temperature` | float | *optional* | Sampling temperature for generation |
 | `top_p` | float | *optional* | Nucleus sampling threshold |
 
-### `GET /health`
+### Health endpoints
 
-Returns service status, model info, CUDA availability, available voices, and cache stats (`audio_cache_size`, `audio_cache_max`).
+- `GET /livez` returns 200 while the API process/event loop is alive.
+- `GET /readyz` returns 200 only when CUDA is available and the configured model is loaded; otherwise it returns 503.
+- `GET /health` returns detailed internal model, CUDA, queue, voice, and cache status.
 
 ### `POST /cache/clear`
 
@@ -192,7 +200,8 @@ Environment variables (set in `.env` file, referenced by `compose.yaml`):
 | `AUDIO_CACHE_MAX` | `256` | Max LRU cache entries for audio output (0 = disabled) |
 | `VOICE_CACHE_MAX` | `32` | LRU cache capacity for voice clone speaker embeddings (0 = disabled) |
 | `TEXT_NORMALIZE` | `true` | Expand numbers, currency, and abbreviations before synthesis |
-| `MAX_QUEUE_DEPTH` | `5` | Max queued requests before 503 rejection (0 = unlimited) |
+| `MAX_QUEUE_DEPTH` | `5` | Max queued requests before 429 + `Retry-After` (0 = unlimited) |
+| `MAX_INPUT_CHARS` | `4000` | Maximum input characters accepted before GPU work |
 | `STREAM_TYPE` | `sentence` | Streaming mode: `sentence` (one chunk per sentence) or `token` (per-token, sub-400ms TTFA) |
 | `STREAM_EMIT_FRAMES` | `4` | Token-mode: emit audio every N codec frames |
 | `STREAM_FIRST_EMIT` | `3` | Token-mode: first-chunk emit interval (0 = disable two-phase) |

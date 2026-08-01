@@ -138,6 +138,17 @@ Note: versions v0.9.0/v0.9.1 are chronologically before v0.10.x but were documen
 
 ---
 
+## Phase 10 — KBN Deployment Foundation (v0.10.6)
+
+**Vision**: A strict, privacy-safe OpenAI-compatible TTS runtime can be operated behind a shared gateway on a single production GPU.
+
+- [x] #116 Add request validation, OpenAI error envelopes, MP3 default and PCM output
+- [x] #116 Add liveness/readiness probes and bounded queue/input behavior
+- [x] #116 Pin the runtime dependency and streaming-fork build inputs
+- [x] #116 Record target-GPU image and integration evidence before milestone closure
+
+---
+
 ## Backlog
 
 No unplaced items.
@@ -146,4 +157,4 @@ No unplaced items.
 
 ## Current Status
 
-**v0.10.3** — Phase 9 Streaming complete. All planned phases complete.
+**v0.10.6** — Phase 10 complete. The KBN edge4 TTS vertical slice is deployed and proved through LiteLLM.

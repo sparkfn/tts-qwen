@@ -27,7 +27,7 @@ with patch.dict("sys.modules", _mock_modules):
         _get_cached_voice_prompt, _split_sentences, _adaptive_max_tokens,
         _audio_cache_key, _get_audio_cache, _set_audio_cache,
         _audio_cache, _AUDIO_CACHE_MAX, _build_gen_kwargs,
-        APIError, ErrorResponse, _effective_stream_mode,
+        APIError, ErrorDetail, ErrorResponse, _effective_stream_mode,
     )
     import server
 
@@ -362,16 +362,16 @@ class TestAdaptiveMaxTokens:
 
 class TestResolveVoice:
     def test_default_voice_when_none(self):
-        assert resolve_voice(None) == "vivian"
+        assert resolve_voice(None) == "vivian.wav"
     def test_openai_alias(self):
-        assert resolve_voice("alloy") == "ryan"
+        assert resolve_voice("alloy") == "ryan.wav"
     def test_case_insensitive(self):
-        assert resolve_voice("VIVIAN") == "vivian"
+        assert resolve_voice("VIVIAN") == "vivian.wav"
     def test_unknown_voice_raises_api_error(self):
         with pytest.raises(APIError) as exc_info:
             resolve_voice("nonexistent_voice")
         assert exc_info.value.status_code == 400
-        assert exc_info.value.code == "UNKNOWN_VOICE"
+        assert exc_info.value.code == "unknown_voice"
         assert "nonexistent_voice" in exc_info.value.message
         assert exc_info.value.context["voice"] == "nonexistent_voice"
         assert isinstance(exc_info.value.context["valid_voices"], list)
@@ -381,40 +381,43 @@ class TestResolveVoice:
 
 class TestErrorResponse:
     def test_error_response_model_fields(self):
-        err = ErrorResponse(code="TEST_ERROR", message="Test", statusCode=400)
-        assert err.code == "TEST_ERROR"
-        assert err.message == "Test"
-        assert err.context is None
-        assert err.statusCode == 400
-
-    def test_error_response_with_context(self):
-        err = ErrorResponse(code="TEST", message="msg", context={"key": "val"}, statusCode=500)
-        d = err.model_dump()
-        assert d["code"] == "TEST"
-        assert d["context"] == {"key": "val"}
-        assert d["statusCode"] == 500
+        err = ErrorResponse(error=ErrorDetail(
+            code="invalid_value", message="Test",
+            type="invalid_request_error", param="speed",
+        ))
+        assert err.error.code == "invalid_value"
+        assert err.error.message == "Test"
+        assert err.error.type == "invalid_request_error"
+        assert err.error.param == "speed"
 
     def test_error_response_serialization(self):
-        err = ErrorResponse(code="X", message="Y", statusCode=422)
+        err = ErrorResponse(error=ErrorDetail(
+            code="server_error", message="Failure", type="server_error",
+        ))
         d = err.model_dump()
-        assert set(d.keys()) == {"code", "message", "context", "statusCode"}
+        assert set(d.keys()) == {"error"}
+        assert set(d["error"].keys()) == {"message", "type", "param", "code"}
 
 
 class TestAPIError:
     def test_api_error_attributes(self):
-        exc = APIError(503, "QUEUE_FULL", "busy", context={"q": 5}, headers={"Retry-After": "5"})
-        assert exc.status_code == 503
-        assert exc.code == "QUEUE_FULL"
+        exc = APIError(429, "QUEUE_FULL", "busy", context={"q": 1},
+                       headers={"Retry-After": "5"}, param="input")
+        assert exc.status_code == 429
+        assert exc.code == "queue_full"
         assert exc.message == "busy"
-        assert exc.context == {"q": 5}
+        assert exc.context == {"q": 1}
         assert exc.headers == {"Retry-After": "5"}
+        assert exc.param == "input"
+        assert exc.error_type == "invalid_request_error"
 
     def test_api_error_is_exception(self):
         exc = APIError(400, "BAD", "bad request")
         assert isinstance(exc, Exception)
 
-    def test_api_error_defaults(self):
+    def test_server_error_type_default(self):
         exc = APIError(500, "ERR", "fail")
+        assert exc.error_type == "server_error"
         assert exc.context is None
         assert exc.headers is None
 
@@ -550,10 +553,91 @@ class TestAudioCacheGetSet:
         assert result[1] == "audio/wav"
 
     def test_cache_disabled_when_max_zero(self):
-        with patch("server._AUDIO_CACHE_MAX", 0):
+        with patch.object(server, "_AUDIO_CACHE_MAX", 0):
             _set_audio_cache("key1", b"data", "audio/wav")
             assert len(_audio_cache) == 0
             assert _get_audio_cache("key1") is None
+
+
+# --- Issue #116: OpenAI-compatible request contract tests ---
+
+
+class TestTTSRequestContract:
+    def test_defaults_to_public_model_and_mp3(self):
+        req = server.TTSRequest(input="hello")
+        assert req.model == "speech-tts"
+        assert req.response_format == "mp3"
+
+    @pytest.mark.parametrize("fmt", ["mp3", "wav", "pcm", "flac", "opus"])
+    def test_accepts_supported_standard_formats(self, fmt):
+        assert server.TTSRequest(input="hello", response_format=fmt).response_format == fmt
+
+    def test_normalizes_format_case(self):
+        assert server.TTSRequest(input="hello", response_format="WAV").response_format == "wav"
+
+    @pytest.mark.parametrize("fmt", ["ogg", "aac", "wave", "garbage"])
+    def test_rejects_unadvertised_formats(self, fmt):
+        with pytest.raises(ValueError, match="response_format"):
+            server.TTSRequest(input="hello", response_format=fmt)
+
+    @pytest.mark.parametrize("speed", [0.25, 1.0, 4.0])
+    def test_accepts_openai_speed_range(self, speed):
+        assert server.TTSRequest(input="hello", speed=speed).speed == speed
+
+    @pytest.mark.parametrize("speed", [0.24, 4.01])
+    def test_rejects_speed_outside_openai_range(self, speed):
+        with pytest.raises(ValueError, match="speed"):
+            server.TTSRequest(input="hello", speed=speed)
+
+    @pytest.mark.parametrize("text", ["", "   "])
+    def test_rejects_empty_input(self, text):
+        with pytest.raises(ValueError, match="input"):
+            server.TTSRequest(input=text)
+
+    def test_rejects_oversized_input(self):
+        with patch.object(server, "MAX_INPUT_CHARS", 4):
+            with pytest.raises(ValueError, match="at most 4"):
+                server.TTSRequest(input="12345")
+
+    @pytest.mark.parametrize("field_name", ["instructions", "instruct"])
+    def test_rejects_unsupported_instructions(self, field_name):
+        with pytest.raises(ValueError, match="not supported"):
+            server.TTSRequest(input="hello", **{field_name: "whisper"})
+
+    def test_rejects_empty_model(self):
+        with pytest.raises(ValueError, match="model"):
+            server.TTSRequest(model=" ", input="hello")
+
+
+class TestPCMEncoding:
+    def test_pcm_is_signed_16_bit_little_endian(self):
+        audio = np.array([-1.0, 0.0, 1.0], dtype=np.float32)
+        payload, media_type = server.convert_audio_format(audio, 24000, "pcm")
+        assert media_type == "audio/pcm"
+        assert np.frombuffer(payload, dtype="<i2").tolist() == [-32767, 0, 32767]
+
+    def test_unknown_format_never_falls_back_to_wav(self):
+        with pytest.raises(ValueError, match="Unsupported audio format"):
+            server.convert_audio_format(np.zeros(10, dtype=np.float32), 24000, "aac")
+
+
+class TestQueueDepthTracker:
+    @pytest.mark.asyncio
+    async def test_release_never_leaks_negative_depth(self):
+        tracker = server._QueueDepthTracker()
+        await tracker.release()
+        assert tracker.depth == 0
+
+    @pytest.mark.asyncio
+    async def test_capacity_uses_429_and_retry_after(self):
+        tracker = server._QueueDepthTracker()
+        with patch.object(server, "MAX_QUEUE_DEPTH", 1):
+            await tracker.acquire("one", "/v1/audio/speech")
+            with pytest.raises(APIError) as exc_info:
+                await tracker.acquire("two", "/v1/audio/speech")
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.headers == {"Retry-After": "5"}
+        await tracker.release()
 
 
 # --- Issue #83: Generation parameter exposure tests ---
@@ -740,9 +824,9 @@ class TestVoiceClonePromptCache:
             server._get_cached_voice_prompt(a0, ref_text="x")  # hit, promotes -> [a1, a0]
             server._get_cached_voice_prompt(a2, ref_text="z")  # evicts a1 -> [a0, a2]
 
-        key0 = hashlib.sha256(a0).hexdigest()
-        key1 = hashlib.sha256(a1).hexdigest()
-        key2 = hashlib.sha256(a2).hexdigest()
+        key0 = hashlib.sha256(a0 + b"x").hexdigest()
+        key1 = hashlib.sha256(a1 + b"y").hexdigest()
+        key2 = hashlib.sha256(a2 + b"z").hexdigest()
         assert key0 in server._voice_prompt_cache
         assert key1 not in server._voice_prompt_cache
         assert key2 in server._voice_prompt_cache
@@ -848,17 +932,13 @@ class TestQuantization:
             with pytest.raises(ImportError, match="bitsandbytes"):
                 server._resolve_quant_kwargs()
 
-    def test_fp8_returns_bfloat16_and_quantization_config(self):
-        """QUANTIZE=fp8 -> bfloat16 dtype, quantization_config in kwargs."""
-        mock_config_cls = MagicMock(name="TorchAoConfig")
-        mock_transformers = MagicMock()
-        mock_transformers.TorchAoConfig = mock_config_cls
-        with patch.dict("sys.modules", {"transformers": mock_transformers}), \
+    def test_fp8_returns_bfloat16_for_post_load_quantization(self):
+        """QUANTIZE=fp8 loads BF16 first; torchao is applied after model load."""
+        with patch.dict("sys.modules", {"torchao": MagicMock()}), \
              patch.object(server, "QUANTIZE", "fp8"):
             dtype, kwargs = server._resolve_quant_kwargs()
         assert dtype == torch.bfloat16
-        assert "quantization_config" in kwargs
-        mock_config_cls.assert_called_once_with("fp8_dynamic_activation_fp8_weight")
+        assert kwargs == {}
 
     def test_unknown_quantize_value_raises_valueerror(self):
         """Unknown QUANTIZE value raises ValueError with descriptive message."""
