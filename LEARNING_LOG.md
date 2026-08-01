@@ -621,3 +621,6 @@ The durable external contract is the OpenAI speech endpoint, not a model-specifi
 The same rule applies to formats. Returning WAV bytes for an unsupported or unavailable MP3/Opus encoder makes the `Content-Type`, file extension, and client decoder disagree. Strict validation and encoder failure are preferable to a successful-looking corrupt contract. Raw PCM is implemented directly as clipped signed 16-bit little-endian samples, making its wire representation deterministic.
 
 Kubernetes readiness is intentionally stronger than process liveness: `/livez` proves the API event loop responds, while `/readyz` requires both CUDA and a loaded model. With `PRELOAD_MODEL=true`, traffic is withheld until cold model startup and warmup are complete.
+
+
+A native BuildKit build on the target Ada host also demonstrated why optional accelerator extensions must be explicit: FlashAttention source compilation exited `-11` before compiler output, while the service already had a correct SDPA fallback. The image build now takes `INSTALL_FLASH_ATTN`; disabling it is a recorded artifact property rather than a hidden `|| true` failure.

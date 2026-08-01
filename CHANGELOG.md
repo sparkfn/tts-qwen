@@ -15,6 +15,7 @@ Prepare the standard KBN edge4 TTS runtime (#116).
 - API failures now use the OpenAI `{"error": {...}}` envelope
 - Queue saturation returns HTTP 429 with `Retry-After` instead of 503
 - Required Python dependencies and the streaming fork are pinned to exact versions/commit
+- FlashAttention installation is an explicit Docker build argument; disabled images use the runtime SDPA fallback
 - Model loading reuses the existing prompt precompute and GPU warmup helpers
 
 ### Fixed

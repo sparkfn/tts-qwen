@@ -32,6 +32,8 @@ curl http://localhost:8101/readyz
 
 The model (~2.4 GB) downloads automatically on first startup.
 
+Docker builds install FlashAttention by default. For a reliability-first image that uses the built-in PyTorch SDPA fallback, build with `--build-arg INSTALL_FLASH_ATTN=false`.
+
 ## API Endpoints
 
 ### `POST /v1/audio/speech`
