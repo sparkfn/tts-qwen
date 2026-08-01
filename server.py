@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager, nullcontext
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, field_validator
 from typing import Optional
@@ -142,6 +143,7 @@ def _validate_env():
         "IDLE_TIMEOUT": "120",
         "REQUEST_TIMEOUT": "300",
         "MAX_QUEUE_DEPTH": "5",
+        "MAX_INPUT_CHARS": "4000",
         "AUDIO_CACHE_MAX": "256",
         "VOICE_CACHE_MAX": "32",
         "MAX_BATCH_SIZE": "4",
@@ -233,23 +235,33 @@ async def lifespan(app):
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(_infer_executor, _unload_model_sync)
 
-class ErrorResponse(BaseModel):
-    """Standard error response shape."""
-    code: str
+class ErrorDetail(BaseModel):
+    """OpenAI-compatible error object."""
     message: str
-    context: dict | None = None
-    statusCode: int
+    type: str
+    param: str | None = None
+    code: str | None = None
+
+
+class ErrorResponse(BaseModel):
+    """OpenAI-compatible top-level error envelope."""
+    error: ErrorDetail
 
 
 class APIError(Exception):
-    """Structured API error that produces a standard JSON response."""
+    """Structured API error rendered with the OpenAI error envelope."""
     def __init__(self, status_code: int, code: str, message: str,
-                 context: dict | None = None, headers: dict | None = None):
+                 context: dict | None = None, headers: dict | None = None,
+                 param: str | None = None, error_type: str | None = None):
         self.status_code = status_code
-        self.code = code
+        self.code = code.lower()
         self.message = message
         self.context = context
         self.headers = headers
+        self.param = param
+        self.error_type = error_type or (
+            "invalid_request_error" if status_code < 500 else "server_error"
+        )
 
 
 app = FastAPI(title="Qwen3-TTS API", lifespan=lifespan)
@@ -259,22 +271,38 @@ app = FastAPI(title="Qwen3-TTS API", lifespan=lifespan)
 async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
-        content=ErrorResponse(
-            code=exc.code, message=exc.message,
-            context=exc.context, statusCode=exc.status_code,
-        ).model_dump(),
+        content=ErrorResponse(error=ErrorDetail(
+            message=exc.message, type=exc.error_type,
+            param=exc.param, code=exc.code,
+        )).model_dump(),
         headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    first = exc.errors()[0] if exc.errors() else {}
+    location = first.get("loc", ())
+    param = str(location[-1]) if location else None
+    message = first.get("msg", "Invalid request")
+    return JSONResponse(
+        status_code=400,
+        content=ErrorResponse(error=ErrorDetail(
+            message=message, type="invalid_request_error",
+            param=param, code="invalid_value",
+        )).model_dump(),
     )
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    error_type = "invalid_request_error" if exc.status_code < 500 else "server_error"
     return JSONResponse(
         status_code=exc.status_code,
-        content=ErrorResponse(
-            code="INTERNAL_ERROR", message=str(exc.detail),
-            statusCode=exc.status_code,
-        ).model_dump(),
+        content=ErrorResponse(error=ErrorDetail(
+            message=str(exc.detail), type=error_type,
+            code="http_error",
+        )).model_dump(),
         headers=getattr(exc, "headers", None),
     )
 
@@ -420,8 +448,11 @@ IDLE_TIMEOUT = int(os.getenv("IDLE_TIMEOUT", "120"))
 # Text normalization (expand numbers, currency, abbreviations)
 TEXT_NORMALIZE = os.getenv("TEXT_NORMALIZE", "true").lower() in ("true", "1", "yes")
 
-# Queue depth limit — 503 when exceeded (0 = unlimited)
+# Queue depth limit — 429 when exceeded (0 = unlimited)
 MAX_QUEUE_DEPTH = int(os.getenv("MAX_QUEUE_DEPTH", "5"))
+
+# Reject unbounded payloads before model loading or GPU work.
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "4000"))
 
 
 class _QueueDepthTracker:
@@ -436,19 +467,19 @@ class _QueueDepthTracker:
         return self._depth
 
     async def acquire(self, request_id: str, endpoint: str) -> None:
-        """Increment depth; raise APIError 503 if queue is full."""
+        """Increment depth; raise APIError 429 if queue is full."""
         async with self._lock:
             if MAX_QUEUE_DEPTH > 0 and self._depth >= MAX_QUEUE_DEPTH:
                 logger.bind(request_id=request_id, endpoint=endpoint,
                              queue_depth=self._depth).warning("Request rejected: queue full")
-                raise APIError(503, "QUEUE_FULL",
-                               f"Server busy: {self._depth} requests queued. Try again later.",
+                raise APIError(429, "QUEUE_FULL",
+                               "The speech service is at capacity. Try again later.",
                                headers={"Retry-After": "5"})
             self._depth += 1
 
     async def release(self) -> None:
         async with self._lock:
-            self._depth -= 1
+            self._depth = max(0, self._depth - 1)
 
 
 _queue_tracker = _QueueDepthTracker()
@@ -527,6 +558,7 @@ logger.bind(
     REQUEST_TIMEOUT=REQUEST_TIMEOUT,
     TEXT_NORMALIZE=TEXT_NORMALIZE,
     MAX_QUEUE_DEPTH=MAX_QUEUE_DEPTH,
+    MAX_INPUT_CHARS=MAX_INPUT_CHARS,
     QUANTIZE=QUANTIZE or "none",
     MAX_BATCH_SIZE=MAX_BATCH_SIZE,
     AUDIO_CACHE_MAX=_AUDIO_CACHE_MAX,
@@ -569,16 +601,56 @@ _voice_prompts: dict = {}  # voice_file → list[VoiceClonePromptItem]
 
 
 class TTSRequest(BaseModel):
+    model: str = "speech-tts"
     input: str
     voice: Optional[str] = None
-    response_format: str = "wav"
+    response_format: str = "mp3"
     speed: float = 1.0
     language: Optional[str] = None
+    instructions: Optional[str] = None
     instruct: Optional[str] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     sample_rate: Optional[int] = None
     stream_mode: Optional[str] = None
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model(cls, v):
+        if not v or not v.strip():
+            raise ValueError("model must not be empty")
+        return v.strip()
+
+    @field_validator("input")
+    @classmethod
+    def _validate_input(cls, v):
+        if not v or not v.strip():
+            raise ValueError("input must not be empty")
+        if len(v) > MAX_INPUT_CHARS:
+            raise ValueError(f"input must be at most {MAX_INPUT_CHARS} characters")
+        return v
+
+    @field_validator("response_format")
+    @classmethod
+    def _validate_response_format(cls, v):
+        value = v.lower()
+        if value not in {"mp3", "wav", "pcm", "flac", "opus"}:
+            raise ValueError("response_format must be one of: mp3, wav, pcm, flac, opus")
+        return value
+
+    @field_validator("speed")
+    @classmethod
+    def _validate_speed(cls, v):
+        if not 0.25 <= v <= 4.0:
+            raise ValueError("speed must be between 0.25 and 4.0")
+        return v
+
+    @field_validator("instructions", "instruct")
+    @classmethod
+    def _reject_unsupported_instructions(cls, v):
+        if v:
+            raise ValueError("instructions are not supported by this model")
+        return v
 
     @field_validator("stream_mode")
     @classmethod
@@ -712,7 +784,7 @@ def _gpu_warmup() -> None:
                 )
             logger.bind(chars=len(text)).debug("Warmup synthesis complete")
         except Exception as e:
-            logger.bind(text_preview=text[:20]).warning("Warmup synthesis failed: {}", e)
+            logger.warning("Warmup synthesis failed: {}", e)
     logger.bind(warmup_ms=round((time.perf_counter() - t_warmup) * 1000)).info("GPU warmup complete")
     # Clear warmup allocations so steady-state VRAM is clean
     _release_gpu_full()
@@ -813,55 +885,8 @@ def _load_model_sync() -> None:
         "Streaming fork detection complete"
     )
 
-    # Pre-compute voice clone prompts from reference audio files
-    logger.info("Pre-computing voice prompts from reference audio")
-    for voice_file in sorted(set(VOICE_MAP.values())):
-        path = os.path.join(_VOICES_DIR, voice_file)
-        if os.path.exists(path):
-            t_v = time.perf_counter()
-            prompts = model.create_voice_clone_prompt(ref_audio=path, x_vector_only_mode=True)
-            _voice_prompts[voice_file] = prompts
-            logger.bind(voice=voice_file, ms=round((time.perf_counter() - t_v) * 1000)).debug("Voice prompt computed")
-        else:
-            logger.bind(voice=voice_file, path=path).warning("Reference audio not found, skipping")
-    logger.bind(voices=len(_voice_prompts)).info("Voice prompts ready")
-
-    # Multi-length warmup to pre-cache CUDA kernels for different input sizes
-    if torch.cuda.is_available() and _voice_prompts:
-        logger.info("Warming up GPU with multi-length synthesis")
-        warmup_prompt = next(iter(_voice_prompts.values()))
-        warmup_texts = [
-            "Hello.",                                       # ~5 tokens — short prompt path
-            "Hello, how are you doing today?",              # ~20 tokens — medium
-            "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.",  # ~50 tokens — longer
-        ]
-        t_warmup = time.perf_counter()
-        for text in warmup_texts:
-            try:
-                with torch.inference_mode():
-                    model.generate_voice_clone(
-                        text=text,
-                        language="English",
-                        voice_clone_prompt=warmup_prompt,
-                        max_new_tokens=256,
-                    )
-                logger.bind(chars=len(text)).debug("Warmup synthesis complete")
-            except Exception as e:
-                logger.bind(text_preview=text[:20]).warning("Warmup synthesis failed: {}", e)
-        logger.bind(warmup_ms=round((time.perf_counter() - t_warmup) * 1000)).info("GPU warmup complete")
-        # Clear warmup allocations so steady-state VRAM is clean
-        _release_gpu_full()
-
-        # Pre-warm CUDA memory pool — allocate and free a large tensor so the
-        # allocator pre-reserves a contiguous block, reducing first-request jitter
-        logger.info("Pre-warming CUDA memory pool")
-        try:
-            dummy = torch.empty(64 * 1024 * 1024, dtype=torch.bfloat16, device="cuda")
-            del dummy
-            torch.cuda.empty_cache()
-            logger.debug("CUDA pool pre-warmed (128 MB dummy tensor)")
-        except Exception as e:
-            logger.warning("CUDA pool pre-warm failed: {}", e)
+    _precompute_voice_prompts()
+    _gpu_warmup()
 
     # Release all unused cached memory back to the driver
     if torch.cuda.is_available():
@@ -990,6 +1015,29 @@ def _set_cpu_affinity():
         logger.warning("Could not set CPU affinity: {}", e)
 
 
+@app.get("/livez")
+async def livez() -> dict:
+    """Liveness probe: the API process and event loop are responding."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz() -> JSONResponse:
+    """Readiness probe: CUDA is usable and the configured model is loaded."""
+    cuda_ready = torch.cuda.is_available()
+    model_ready = model is not None
+    ready = cuda_ready and model_ready
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content={
+            "status": "ready" if ready else "not_ready",
+            "cuda": cuda_ready,
+            "model_loaded": model_ready,
+            "model_id": loaded_model_id,
+        },
+    )
+
+
 @app.get("/health")
 async def health() -> dict:
     gpu_info = {}
@@ -1057,8 +1105,11 @@ def convert_audio_format(audio_data: np.ndarray, sample_rate: int, output_format
             audio_segment.export(buffer, format="mp3")
             content_type = "audio/mpeg"
         else:
-            sf.write(buffer, audio_data, sample_rate, format="WAV")
-            content_type = "audio/wav"
+            raise RuntimeError("MP3 encoding requires pydub and ffmpeg")
+    elif output_format == "pcm":
+        clipped = np.clip(audio_data, -1.0, 1.0)
+        buffer.write((clipped * 32767).astype("<i2").tobytes())
+        content_type = "audio/pcm"
     elif output_format == "flac":
         sf.write(buffer, audio_data, sample_rate, format="FLAC")
         content_type = "audio/flac"
@@ -1077,11 +1128,9 @@ def convert_audio_format(audio_data: np.ndarray, sample_rate: int, output_format
             )
             content_type = "audio/ogg"
         else:
-            sf.write(buffer, audio_data, sample_rate, format="WAV")
-            content_type = "audio/wav"
+            raise RuntimeError("Opus encoding requires pydub and ffmpeg")
     else:
-        sf.write(buffer, audio_data, sample_rate, format="WAV")
-        content_type = "audio/wav"
+        raise ValueError(f"Unsupported audio format: {output_format}")
 
     buffer.seek(0)
     return buffer.read(), content_type
@@ -1100,7 +1149,7 @@ def resolve_voice(voice: Optional[str]) -> str:
         valid = sorted(VOICE_MAP.keys())
         logger.bind(voice=voice).warning("Unknown voice requested")
         raise APIError(400, "UNKNOWN_VOICE", f"Unknown voice '{voice}'",
-                       context={"voice": voice, "valid_voices": valid})
+                       context={"voice": voice, "valid_voices": valid}, param="voice")
     return resolved
 
 
@@ -1148,9 +1197,7 @@ def detect_language(text: str) -> str:
             lang = result.get("lang", "en")
             return _LANG_MAP.get(lang, "English")
         except Exception as e:
-            logger.bind(text_preview=text[:40]).debug(
-                "fasttext language detection failed, using Unicode heuristic: {}", e
-            )
+            logger.debug("fasttext language detection failed, using Unicode heuristic: {}", e)
     return _detect_language_unicode(text)
 
 
@@ -1311,7 +1358,7 @@ def _get_cached_voice_prompt(audio_bytes: bytes, ref_text: str | None):
     try:
         ref_audio_data, ref_sr = sf.read(io.BytesIO(audio_bytes))
     except Exception as e:
-        raise APIError(400, "INVALID_AUDIO", f"Cannot read reference audio: {e}")
+        raise APIError(400, "INVALID_AUDIO", "Cannot read reference audio", param="file")
 
     if len(ref_audio_data.shape) > 1:
         ref_audio_data = ref_audio_data.mean(axis=1)
@@ -1327,7 +1374,7 @@ def _get_cached_voice_prompt(audio_bytes: bytes, ref_text: str | None):
         )
     except Exception as e:
         logger.opt(exception=True).error("create_voice_clone_prompt failed")
-        raise APIError(500, "CLONE_FAILED", f"Voice prompt creation failed: {e}")
+        raise APIError(500, "CLONE_FAILED", "Voice prompt creation failed")
     logger.bind(cache_key=cache_key[:12], encode_ms=round((time.perf_counter() - t_encode) * 1000)).debug(
         "Voice prompt encoded"
     )
@@ -1450,15 +1497,6 @@ async def synthesize_speech(request: TTSRequest) -> Response:
     request_id = str(uuid.uuid4())[:8]
     t_start = time.perf_counter()
 
-    if not request.input or not request.input.strip():
-        logger.bind(request_id=request_id, endpoint="/v1/audio/speech").warning("Request rejected: empty input")
-        raise APIError(400, "EMPTY_INPUT", "Input text is required")
-
-    if request.instruct:
-        logger.bind(request_id=request_id, endpoint="/v1/audio/speech").warning(
-            "instruct parameter ignored — Base model does not support instruct"
-        )
-
     voice_file = resolve_voice(request.voice)
     text = request.input.strip()
     await _queue_tracker.acquire(request_id, "/v1/audio/speech")
@@ -1547,7 +1585,7 @@ async def synthesize_speech(request: TTSRequest) -> Response:
         raise
     except Exception as e:
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech").opt(exception=True).error("Synthesis failed")
-        raise APIError(500, "SYNTHESIS_FAILED", f"Synthesis failed: {str(e)}")
+        raise APIError(500, "SYNTHESIS_FAILED", "Speech synthesis failed")
     finally:
         await _queue_tracker.release()
 
@@ -1617,7 +1655,7 @@ async def synthesize_speech_stream(request: TTSRequest) -> StreamingResponse:
                 except Exception as e:
                     logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream",
                                 chunks_sent=chunks_sent).opt(exception=True).error("Token stream failed")
-                    yield f"data: [ERROR] {str(e)}\n\n"
+                    yield "data: [ERROR] Speech synthesis failed\n\n"
                     return
 
                 yield "data: [DONE]\n\n"
@@ -1700,7 +1738,7 @@ async def synthesize_speech_stream(request: TTSRequest) -> StreamingResponse:
                 except Exception as e:
                     logger.bind(request_id=request_id, endpoint="/v1/audio/speech/stream", voice=voice_file,
                                  chunks_sent=chunks_sent).opt(exception=True).error("Stream synthesis failed")
-                    yield f"data: [ERROR] {str(e)}\n\n"
+                    yield "data: [ERROR] Speech synthesis failed\n\n"
                     return
 
             yield "data: [DONE]\n\n"
@@ -1810,7 +1848,7 @@ async def clone_voice(
         raise
     except Exception as e:
         logger.bind(request_id=request_id, endpoint="/v1/audio/speech/clone").opt(exception=True).error("Voice clone failed")
-        raise APIError(500, "CLONE_FAILED", f"Voice clone failed: {str(e)}")
+        raise APIError(500, "CLONE_FAILED", "Voice clone failed")
     finally:
         await _queue_tracker.release()
 

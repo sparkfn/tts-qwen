@@ -37,15 +37,15 @@ RUN FLASH_ATTENTION_FORCE_BUILD=TRUE \
     pip install --no-cache-dir flash-attn --no-build-isolation
 
 # Optional quantization
-RUN pip install --no-cache-dir "bitsandbytes>=0.43.0" || true
+RUN pip install --no-cache-dir "bitsandbytes==0.49.2" || true
 # torchao for FP8 quantization (transformers 4.57+ expects this version's API)
-RUN pip install --no-cache-dir torchao || true
+RUN pip install --no-cache-dir torchao==0.16.0 || true
 
 # Streaming TTS fork — MUST be last pip install to override qwen-tts==0.1.1
 # from requirements.txt. Adds stream_generate_voice_clone() method.
 # No || true — this is required, fail the build if it doesn't install.
 RUN pip install --no-cache-dir --no-deps --force-reinstall \
-    "qwen-tts @ git+https://github.com/rekuenkdr/Qwen3-TTS-streaming.git"
+    "qwen-tts @ git+https://github.com/rekuenkdr/Qwen3-TTS-streaming.git@b8db6ff1cebc0d6554cf0977045850bcc796b383"
 
 # Copy application
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
