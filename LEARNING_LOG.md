@@ -624,3 +624,15 @@ Kubernetes readiness is intentionally stronger than process liveness: `/livez` p
 
 
 A native BuildKit build on the target Ada host also demonstrated why optional accelerator extensions must be explicit: FlashAttention source compilation exited `-11` before compiler output, while the service already had a correct SDPA fallback. The image build now takes `INSTALL_FLASH_ATTN`; disabling it is a recorded artifact property rather than a hidden `|| true` failure.
+---
+
+## Entry 0024 — A gateway-compatible API must be tested at the gateway, not inferred from the backend
+**Date**: 2026-08-01
+**Type**: What just happened
+**Related**: #116, sparkfn/kbn-clusters#106
+
+The runtime passed direct MP3, WAV, PCM, validation, and capacity tests, but the first public pass still exposed three LiteLLM 1.93.0 defects: every successful format was labeled `audio/mpeg`, mapped backend 4xx/429 failures escaped as 500, and missing required speech fields reached the router as Python `TypeError`. None of those failures could have been found by testing the FastAPI service alone. KBN fixed the exact pinned gateway with a narrow assertion-guarded startup patch while keeping authentication and routing in LiteLLM.
+
+The final release therefore treats the public path as the unit of compatibility. The official OpenAI SDK, five wire formats, error envelopes, immediate 429 backpressure, path restriction, persisted logging fields, 100 sequential requests, and a one-hour soak were all exercised through `speech.sparkfn.io`. The deployed 0.6B Base model used only 2.75 GiB peak VRAM on the RTX 4060 Ti during the burst, leaving substantially more than the required safety margin; the unstable RTX 3070 stayed at driver-idle memory.
+
+Another reproducibility lesson surfaced at closeout: pinning only the model repository name is not pinning the model. The production manifest now loads Hugging Face snapshot `5d83992436eae1d760afd27aff78a71d676296fc` from the node-local cache with offline mode enabled. That turns a successful warm restart into evidence for the same artifact, not merely the same mutable repository name.
