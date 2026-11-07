@@ -609,6 +609,51 @@ class TestTTSRequestContract:
             server.TTSRequest(model=" ", input="hello")
 
 
+class TestMemoryOnlyMP3Encoding:
+    def test_mp3_uses_the_in_memory_encoder(self):
+        encoder = MagicMock()
+        encoder.save.side_effect = lambda out, *_args, **_kwargs: out.write(b"mp3")
+        samples = np.linspace(-1, 1, 240, dtype=np.float32)[::-1]
+        encoder.load.return_value = (torch.from_numpy(np.ascontiguousarray(samples)).unsqueeze(0), 24000)
+        with patch.object(server, "_TORCHAUDIO", True), \
+             patch.object(server, "torchaudio", encoder, create=True), \
+             patch.object(server, "_PydubAudioSegment") as pydub:
+            payload, media_type = server.convert_audio_format(samples, 24000, "mp3")
+        assert payload == b"mp3"
+        assert media_type == "audio/mpeg"
+        assert isinstance(encoder.load.call_args.args[0], io.BytesIO)
+        assert encoder.load.call_args.kwargs == {"format": "wav", "backend": "ffmpeg"}
+        assert isinstance(encoder.save.call_args.args[0], io.BytesIO)
+        assert encoder.save.call_args.args[1].shape == (1, 240)
+        assert encoder.save.call_args.kwargs == {"format": "mp3", "backend": "ffmpeg"}
+        pydub.from_wav.assert_not_called()
+
+    def test_mp3_refuses_instead_of_falling_back_to_disk(self):
+        with patch.object(server, "_TORCHAUDIO", False), patch.object(server, "_PydubAudioSegment") as pydub:
+            with pytest.raises(RuntimeError, match="in-memory"):
+                server.convert_audio_format(np.zeros(10, dtype=np.float32), 24000, "mp3")
+        pydub.from_wav.assert_not_called()
+
+    @pytest.mark.parametrize("step", ["load", "save"])
+    def test_mp3_backend_failure_never_uses_pydub(self, step):
+        encoder = MagicMock()
+        encoder.load.return_value = (torch.zeros((1, 10)), 24000)
+        getattr(encoder, step).side_effect = RuntimeError("backend unavailable")
+        with patch.object(server, "_TORCHAUDIO", True), \
+             patch.object(server, "torchaudio", encoder, create=True), \
+             patch.object(server, "_PydubAudioSegment") as pydub:
+            with pytest.raises(RuntimeError, match="backend unavailable"):
+                server.convert_audio_format(np.zeros(10, dtype=np.float32), 24000, "mp3")
+        pydub.from_wav.assert_not_called()
+
+    def test_mp3_round_trips_with_the_real_encoder(self):
+        samples = np.linspace(-0.5, 0.5, 2400, dtype=np.float32)
+        payload, media_type = server.convert_audio_format(samples, 24000, "mp3")
+        decoded, sample_rate = server.torchaudio.load(io.BytesIO(payload), format="mp3", backend="ffmpeg")
+        assert media_type == "audio/mpeg" and sample_rate == 24000
+        assert decoded.shape == (1, 2400)
+
+
 class TestPCMEncoding:
     def test_pcm_is_signed_16_bit_little_endian(self):
         audio = np.array([-1.0, 0.0, 1.0], dtype=np.float32)

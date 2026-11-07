@@ -1097,15 +1097,15 @@ def convert_audio_format(audio_data: np.ndarray, sample_rate: int, output_format
             sf.write(buffer, audio_data, sample_rate, format="WAV")
         content_type = "audio/wav"
     elif output_format == "mp3":
-        if _PydubAudioSegment is not None:
-            wav_buffer = io.BytesIO()
-            sf.write(wav_buffer, audio_data, sample_rate, format="WAV")
-            wav_buffer.seek(0)
-            audio_segment = _PydubAudioSegment.from_wav(wav_buffer)
-            audio_segment.export(buffer, format="mp3")
-            content_type = "audio/mpeg"
-        else:
-            raise RuntimeError("MP3 encoding requires pydub and ffmpeg")
+        if not _TORCHAUDIO:
+            raise RuntimeError("MP3 encoding requires the in-memory torchaudio FFmpeg backend")
+        # Preserve the existing PCM16 conversion without pydub's disk-backed temp files.
+        wav_buffer = io.BytesIO()
+        sf.write(wav_buffer, audio_data, sample_rate, format="WAV")
+        wav_buffer.seek(0)
+        audio_tensor, _ = torchaudio.load(wav_buffer, format="wav", backend="ffmpeg")
+        torchaudio.save(buffer, audio_tensor, sample_rate, format="mp3", backend="ffmpeg")
+        content_type = "audio/mpeg"
     elif output_format == "pcm":
         clipped = np.clip(audio_data, -1.0, 1.0)
         buffer.write((clipped * 32767).astype("<i2").tobytes())
